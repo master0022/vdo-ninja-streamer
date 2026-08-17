@@ -1,5 +1,7 @@
 name: Windows release
 
+run-name: Release ${{ inputs.tag || github.ref_name }}
+
 on:
   push:
     tags:
