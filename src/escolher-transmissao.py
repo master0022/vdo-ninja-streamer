@@ -429,6 +429,9 @@ def enumerate_monitors():
 
 
 def fit_source(obs, item_id):
+    video = obs.optional("GetVideoSettings") or {}
+    canvas_width = float(video.get("baseWidth", CANVAS_WIDTH))
+    canvas_height = float(video.get("baseHeight", CANVAS_HEIGHT))
     for _ in range(20):
         transform = obs.call(
             "GetSceneItemTransform", {"sceneName": SCENE, "sceneItemId": item_id}
@@ -454,8 +457,8 @@ def fit_source(obs, item_id):
                 "cropBottom": 0,
                 "boundsType": "OBS_BOUNDS_SCALE_INNER",
                 "boundsAlignment": 5,
-                "boundsWidth": CANVAS_WIDTH,
-                "boundsHeight": CANVAS_HEIGHT,
+                "boundsWidth": canvas_width,
+                "boundsHeight": canvas_height,
                 "cropToBounds": False,
             },
         },

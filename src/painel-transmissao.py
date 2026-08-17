@@ -608,6 +608,38 @@ class PanelApp:
         except Exception:
             return fallback
 
+    @staticmethod
+    def canvas_for_settings(settings):
+        if settings["output_width"] <= 1280 and settings["output_height"] <= 720:
+            return settings["output_width"], settings["output_height"]
+        return 3840, 2160
+
+    @staticmethod
+    def scale_type_for_settings(settings):
+        return "bicubic" if settings["output_width"] <= 1280 and settings["output_height"] <= 720 else "lanczos"
+
+    @staticmethod
+    def nvenc_preset_for_settings(settings):
+        if settings["encoder"] in {"nvenc_h264", "nvenc_hevc", "nvenc_av1"}:
+            return "p4" if settings["output_width"] <= 1280 and settings["output_height"] <= 720 else "p5"
+        return None
+
+    @classmethod
+    def tuning_matches(cls, obs, settings):
+        expected_width, expected_height = cls.canvas_for_settings(settings)
+        try:
+            video = obs.call("GetVideoSettings")
+            if int(video.get("baseWidth", 0)) != expected_width or int(video.get("baseHeight", 0)) != expected_height:
+                return False
+        except Exception:
+            return False
+        if cls.profile_value(obs, "Video", "ScaleType", "") != cls.scale_type_for_settings(settings):
+            return False
+        expected_preset = cls.nvenc_preset_for_settings(settings)
+        if expected_preset and cls.profile_value(obs, "SimpleOutput", "NVENCPreset2", "") != expected_preset:
+            return False
+        return True
+
     def current_settings(self, obs):
         settings = dict(DEFAULT_SETTINGS)
         try:
@@ -641,6 +673,7 @@ class PanelApp:
         return settings
 
     def apply_settings_to_obs(self, obs, settings):
+        canvas_width, canvas_height = self.canvas_for_settings(settings)
         obs.call(
             "SetProfileParameter",
             {
@@ -665,12 +698,11 @@ class PanelApp:
                 "parameterValue": str(settings["audio_bitrate"]),
             },
         )
-        current_video = obs.call("GetVideoSettings")
         obs.call(
             "SetVideoSettings",
             {
-                "baseWidth": int(current_video.get("baseWidth", 3840)),
-                "baseHeight": int(current_video.get("baseHeight", 2160)),
+                "baseWidth": canvas_width,
+                "baseHeight": canvas_height,
                 "outputWidth": settings["output_width"],
                 "outputHeight": settings["output_height"],
                 "fpsNumerator": settings["fps"],
@@ -682,17 +714,28 @@ class PanelApp:
             {
                 "parameterCategory": "Video",
                 "parameterName": "ScaleType",
-                "parameterValue": "lanczos",
+                "parameterValue": self.scale_type_for_settings(settings),
             },
         )
+        expected_preset = self.nvenc_preset_for_settings(settings)
+        if expected_preset:
+            obs.call(
+                "SetProfileParameter",
+                {
+                    "parameterCategory": "SimpleOutput",
+                    "parameterName": "NVENCPreset2",
+                    "parameterValue": expected_preset,
+                },
+            )
 
     def ensure_saved_settings(self, obs):
         if self.saved_settings is None:
             self.saved_settings = self.current_settings(obs)
             self.persist_settings(self.saved_settings)
+            self.apply_settings_to_obs(obs, self.saved_settings)
             return
         actual = self.current_settings(obs)
-        if self.settings_match(actual, self.saved_settings):
+        if self.settings_match(actual, self.saved_settings) and self.tuning_matches(obs, self.saved_settings):
             return
         was_active = self.stop_output(obs)
         try:

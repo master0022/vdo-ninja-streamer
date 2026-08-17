@@ -24,6 +24,10 @@ H.264 is the safest choice for browser compatibility. Stream settings are
 written atomically to `settings.json` beside the portable app. If that folder
 is not writable, the app falls back to `%LOCALAPPDATA%\VDO-Ninja-Streamer`.
 
+For 1280×720 output the app uses a matching canvas, Bicubic scaling, and NVENC
+P4 to reduce render and encoder pressure on older GPUs. The 1080p path keeps a
+4K canvas, Lanczos scaling, and NVENC P5 for higher downscale quality.
+
 The release is portable and does not require a Python or .NET installation.
 
 ## Building locally
