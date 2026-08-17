@@ -70,6 +70,12 @@ ENCODER_OPTIONS = {
         "plugin": None,
     },
 }
+SCALE_FILTER_OPTIONS = {
+    "auto": "Automático (leve em 720p)",
+    "lanczos": "Lanczos (máxima nitidez)",
+    "bicubic": "Bicubic (equilibrado)",
+    "none": "Nenhum (canvas = saída)",
+}
 DEFAULT_SETTINGS = {
     "video_bitrate": 6000,
     "audio_bitrate": 160,
@@ -77,6 +83,7 @@ DEFAULT_SETTINGS = {
     "output_width": 1920,
     "output_height": 1080,
     "encoder": "nvenc_h264",
+    "scale_filter": "auto",
 }
 
 PICKER_MODULE_PATH = PACKAGE_DIR / "escolher-transmissao.py"
@@ -203,6 +210,7 @@ HTML = r"""<!doctype html>
           <label class="field">Quadros <small>por segundo</small><select id="fps"><option value="60">60 FPS</option><option value="30">30 FPS</option></select></label>
           <label class="field">Saída <small>resolução</small><select id="resolution"><option value="1920x1080">1920 × 1080</option><option value="1280x720">1280 × 720</option></select></label>
           <label class="field">Encoder <small>vídeo</small><select id="encoder"></select></label>
+          <label class="field">Redimensionamento <small>filtro</small><select id="scaleFilter"><option value="auto">Automático (leve em 720p)</option><option value="lanczos">Lanczos (máxima nitidez)</option><option value="bicubic">Bicubic (equilibrado)</option><option value="none">Nenhum (canvas = saída)</option></select></label>
         </div>
         <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
@@ -237,6 +245,7 @@ HTML = r"""<!doctype html>
       if (settings.fps) $('fps').value = settings.fps;
       if (settings.output_width && settings.output_height) $('resolution').value = `${settings.output_width}x${settings.output_height}`;
       if (settings.encoder) $('encoder').value = settings.encoder;
+      if (settings.scale_filter) $('scaleFilter').value = settings.scale_filter;
     }
     function readSettingsFields() {
       const [output_width, output_height] = $('resolution').value.split('x').map(Number);
@@ -247,13 +256,14 @@ HTML = r"""<!doctype html>
         output_width,
         output_height,
         encoder: $('encoder').value,
+        scale_filter: $('scaleFilter').value,
       };
     }
     function refreshSettingsDirty() {
       const current = readSettingsFields();
       const saved = state.settings || {};
       const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder;
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter;
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -293,6 +303,7 @@ HTML = r"""<!doctype html>
         output_width,
         output_height,
         encoder: $('encoder').value,
+        scale_filter: $('scaleFilter').value,
       }, true);
     }
     async function share(path, payload, syncSettings = false) { setStatus(path === '/api/settings' ? 'Salvando ajustes no OBS...' : 'Preparando o OBS...', ''); try { const response = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Falha desconhecida'); state = data; if (syncSettings) { settingsDirty = false; $('settingsDirty').hidden = true; } render(syncSettings); setStatus(data.message || 'Transmissão atualizada.', 'ok'); } catch (e) { setStatus(e.message, 'error'); } }
@@ -305,6 +316,7 @@ HTML = r"""<!doctype html>
     $('saveSettings').addEventListener('click', saveSettings);
     ['videoBitrate', 'audioBitrate', 'fps', 'resolution'].forEach(id => $(id).addEventListener('input', refreshSettingsDirty));
     $('encoder').addEventListener('change', refreshSettingsDirty);
+    $('scaleFilter').addEventListener('change', refreshSettingsDirty);
     $('search').addEventListener('input', render);
     document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { activeTab = tab.dataset.tab; document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab)); $('windowsPanel').hidden = activeTab !== 'windows'; $('screenPanel').hidden = activeTab !== 'screen'; if (activeTab === 'screen') render(); }));
     load();
@@ -610,12 +622,22 @@ class PanelApp:
 
     @staticmethod
     def canvas_for_settings(settings):
-        if settings["output_width"] <= 1280 and settings["output_height"] <= 720:
+        scale_filter = settings.get("scale_filter", DEFAULT_SETTINGS["scale_filter"])
+        if scale_filter == "none":
+            return settings["output_width"], settings["output_height"]
+        if scale_filter == "bicubic" and settings["output_width"] <= 1280 and settings["output_height"] <= 720:
+            return 1920, 1080
+        if scale_filter == "auto" and settings["output_width"] <= 1280 and settings["output_height"] <= 720:
             return settings["output_width"], settings["output_height"]
         return 3840, 2160
 
     @staticmethod
     def scale_type_for_settings(settings):
+        scale_filter = settings.get("scale_filter", DEFAULT_SETTINGS["scale_filter"])
+        if scale_filter in {"lanczos", "bicubic"}:
+            return scale_filter
+        if scale_filter == "none":
+            return "bilinear"
         return "bicubic" if settings["output_width"] <= 1280 and settings["output_height"] <= 720 else "lanczos"
 
     @staticmethod
@@ -670,6 +692,12 @@ class PanelApp:
             ENCODER_OPTIONS[DEFAULT_SETTINGS["encoder"]]["obs_value"],
         )
         settings["encoder"] = self.encoder_id_from_obs(current_encoder)
+        current_scale = self.profile_value(obs, "Video", "ScaleType", "")
+        settings["scale_filter"] = {
+            "lanczos": "lanczos",
+            "bicubic": "bicubic",
+            "bilinear": "none",
+        }.get(current_scale, DEFAULT_SETTINGS["scale_filter"])
         return settings
 
     def apply_settings_to_obs(self, obs, settings):
@@ -847,11 +875,14 @@ class PanelApp:
             "output_width": number("output_width", 1, 4096),
             "output_height": number("output_height", 1, 4096),
             "encoder": payload.get("encoder", DEFAULT_SETTINGS["encoder"]),
+            "scale_filter": payload.get("scale_filter", DEFAULT_SETTINGS["scale_filter"]),
         }
         if settings["encoder"] not in ENCODER_OPTIONS:
             raise ValueError("Encoder inválido.")
         if settings["encoder"] not in {item["id"] for item in PanelApp.available_encoders()}:
             raise ValueError("Esse encoder não está disponível nesta instalação do OBS.")
+        if settings["scale_filter"] not in SCALE_FILTER_OPTIONS:
+            raise ValueError("Filtro de redimensionamento inválido.")
         if settings["fps"] not in {30, 60}:
             raise ValueError("FPS disponível: 30 ou 60.")
         if (settings["output_width"], settings["output_height"]) not in {
@@ -882,7 +913,8 @@ class PanelApp:
                 f"Ajustes salvos: {settings['video_bitrate']} kbps de vídeo, "
                 f"{settings['audio_bitrate']} kbps de áudio, {settings['fps']} FPS, "
                 f"{settings['output_width']}×{settings['output_height']}, "
-                f"{ENCODER_OPTIONS[settings['encoder']]['label']}. "
+                f"{ENCODER_OPTIONS[settings['encoder']]['label']}, "
+                f"{SCALE_FILTER_OPTIONS[settings['scale_filter']]}. "
                 f"Arquivo: {self.settings_file}."
             )
             if was_active:
