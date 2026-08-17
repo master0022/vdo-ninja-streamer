@@ -35,6 +35,15 @@ $obsRoot = Join-Path $packageRoot "obs-portable"
 $obsAppRoot = Join-Path $obsRoot "app"
 New-Item -ItemType Directory -Path $appOutput, $obsAppRoot | Out-Null
 
+$iconOutput = Join-Path $repoRoot "packaging\generated-icons"
+Invoke-Checked -FilePath "python" -Arguments @(
+    (Join-Path $repoRoot "packaging\create-icons.py"),
+    "--output", $iconOutput
+)
+$mainIcon = Join-Path $iconOutput "streamer.ico"
+$redIcon = Join-Path $iconOutput "streamer-red.ico"
+$greenIcon = Join-Path $iconOutput "streamer-green.ico"
+
 $checksums = @{
     "32.2.0" = "793c8866796f94b907646c63ac73b9d0df7e98dcdab5b6bfd5baebf153e1ed92"
     "32.2.1" = "db64a2934f8261f85b1410b84be011207a0afda5400d008289f1f1e211bcc7de"
@@ -90,7 +99,7 @@ $websocketConfig | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -Literal
 
 $panelArgs = @(
     "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--noconsole",
-    "--name", "painel-transmissao", "--distpath", $appOutput,
+    "--name", "painel-transmissao", "--icon", $mainIcon, "--distpath", $appOutput,
     "--workpath", (Join-Path $repoRoot "src\_build\painel"),
     "--specpath", (Join-Path $repoRoot "src\_build"),
     "--add-data", ((Join-Path $repoRoot "src\escolher-transmissao.py") + ";."),
@@ -106,12 +115,14 @@ Invoke-Checked -FilePath "python" -Arguments $panelArgs
 
 $statusArgs = @(
     "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--noconsole",
-    "--name", "status-transmissao", "--distpath", $appOutput,
+    "--name", "status-transmissao", "--icon", $mainIcon, "--distpath", $appOutput,
     "--workpath", (Join-Path $repoRoot "src\_build\status"),
     "--specpath", (Join-Path $repoRoot "src\_build"),
     (Join-Path $repoRoot "src\status-transmissao.py")
 )
 Invoke-Checked -FilePath "python" -Arguments $statusArgs
+Copy-Item -LiteralPath $redIcon -Destination $appOutput
+Copy-Item -LiteralPath $greenIcon -Destination $appOutput
 
 $publishRoot = Join-Path $releaseRoot "_supervisor-publish"
 $dotnetArgs = @(
@@ -121,7 +132,8 @@ $dotnetArgs = @(
     "-p:PublishSingleFile=true",
     "-p:IncludeNativeLibrariesForSelfExtract=true",
     "-p:EnableCompressionInSingleFile=true",
-    "-p:InvariantGlobalization=true"
+    "-p:InvariantGlobalization=true",
+    "-p:ApplicationIcon=$mainIcon"
 )
 Invoke-Checked -FilePath "dotnet" -Arguments $dotnetArgs
 Copy-Item -LiteralPath (Join-Path $publishRoot "VDO-Ninja-Streamer.exe") -Destination $packageRoot

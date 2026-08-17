@@ -1,6 +1,7 @@
 import json
 import msvcrt
 import os
+import sys
 import tkinter as tk
 import urllib.request
 import webbrowser
@@ -11,6 +12,12 @@ API_URL = "http://127.0.0.1:8765/api/state"
 STOP_URL = "http://127.0.0.1:8765/api/stop"
 PANEL_URL = "http://127.0.0.1:8765/"
 LOCK_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "VDO-Ninja-Streamer" / "status-window.lock"
+
+
+def icon_directory():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent / "packaging" / "generated-icons"
 
 
 def acquire_single_instance_lock():
@@ -38,7 +45,8 @@ class StatusWindow:
         self.root.protocol("WM_DELETE_WINDOW", self.stop_and_close)
         self.red_icon = self.make_icon("#e34b60")
         self.green_icon = self.make_icon("#36c98f")
-        self.root.iconphoto(True, self.red_icon)
+        self.active = None
+        self.set_window_icon(False)
         self.root.update_idletasks()
         x = max(10, self.root.winfo_screenwidth() - 326)
         self.root.geometry(f"300x136+{x}+34")
@@ -91,7 +99,7 @@ class StatusWindow:
                 state = json.loads(response.read().decode("utf-8"))
             active = bool(state.get("stream_active"))
             if active:
-                self.root.iconphoto(True, self.green_icon)
+                self.set_window_icon(True)
                 self.set_circle("#36c98f")
                 self.state_label.configure(text="TRANSMITINDO", fg="#8cf0c1")
                 if state.get("source_mode") == "window":
@@ -102,19 +110,34 @@ class StatusWindow:
                     self.source_label.configure(text="Tela inteira")
                     self.detail_label.configure(text="Áudio e vídeo ativos")
             else:
-                self.root.iconphoto(True, self.red_icon)
+                self.set_window_icon(False)
                 self.set_circle("#e34b60")
                 self.state_label.configure(text="PARADO", fg="#ff8797")
                 self.source_label.configure(text="Nenhuma transmissão ativa")
                 message = state.get("message") or "Pronto para transmitir"
                 self.detail_label.configure(text=message[:56])
         except Exception:
-            self.root.iconphoto(True, self.red_icon)
+            self.set_window_icon(False)
             self.set_circle("#e34b60")
             self.state_label.configure(text="PAINEL OFFLINE", fg="#ff8797")
             self.source_label.configure(text="Abra o painel novamente")
             self.detail_label.configure(text="Não consegui consultar o OBS")
         self.root.after(1000, self.refresh)
+
+    def set_window_icon(self, active):
+        if self.active == active:
+            return
+        self.active = active
+        image = self.green_icon if active else self.red_icon
+        self.root.iconphoto(True, image)
+        icon_path = icon_directory() / ("streamer-green.ico" if active else "streamer-red.ico")
+        if icon_path.exists():
+            try:
+                # iconphoto changes Tk's image; iconbitmap changes the native
+                # Windows taskbar/window icon as well.
+                self.root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
 
 
 def main():

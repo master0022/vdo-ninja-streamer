@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 src/_build/
+packaging/generated-icons/
 build/
 dist/
 release/
