@@ -18,6 +18,12 @@ excluding known Discord process variants.
 4. Open the panel, choose a window or monitor, and share the viewer link.
 5. Close the supervisor when finished; that stops the stream and bundled OBS.
 
+The panel exposes the available OBS video encoders from the bundled runtime,
+including NVENC H.264, NVENC HEVC, NVENC AV1, QuickSync, and x264 when present.
+H.264 is the safest choice for browser compatibility. Stream settings are
+written atomically to `settings.json` beside the portable app. If that folder
+is not writable, the app falls back to `%LOCALAPPDATA%\VDO-Ninja-Streamer`.
+
 The release is portable and does not require a Python or .NET installation.
 
 ## Building locally

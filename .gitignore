@@ -14,6 +14,8 @@ _app/
 obs-portable/
 *.exe
 *.zip
+settings.json
+.*.tmp
 
 # Local editor/OS files
 .vs/

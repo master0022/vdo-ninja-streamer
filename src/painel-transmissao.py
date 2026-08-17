@@ -38,14 +38,45 @@ IDENTITY_DIR = Path(
     )
 )
 IDENTITY_FILE = IDENTITY_DIR / "identity.json"
-SETTINGS_FILE = IDENTITY_DIR / "settings.json"
+LEGACY_SETTINGS_FILE = IDENTITY_DIR / "settings.json"
+SETTINGS_FILE = Path(
+    os.environ.get("VDO_NINJA_SETTINGS_FILE", str(ROOT / "settings.json"))
+)
 STATUS_SCRIPT = EXECUTABLE_DIR / ("status-transmissao.exe" if FROZEN else "status-transmissao.py")
+ENCODER_OPTIONS = {
+    "nvenc_h264": {
+        "label": "NVIDIA NVENC H.264 (mais compatível)",
+        "obs_value": "nvenc",
+        "plugin": "obs-nvenc.dll",
+    },
+    "nvenc_hevc": {
+        "label": "NVIDIA NVENC HEVC / H.265",
+        "obs_value": "nvenc_hevc",
+        "plugin": "obs-nvenc.dll",
+    },
+    "nvenc_av1": {
+        "label": "NVIDIA NVENC AV1 (melhor eficiência)",
+        "obs_value": "av1_nvenc",
+        "plugin": "obs-nvenc.dll",
+    },
+    "qsv_h264": {
+        "label": "Intel QuickSync H.264",
+        "obs_value": "obs_qsv11",
+        "plugin": "obs-qsv11.dll",
+    },
+    "x264": {
+        "label": "x264 (CPU)",
+        "obs_value": "obs_x264",
+        "plugin": None,
+    },
+}
 DEFAULT_SETTINGS = {
     "video_bitrate": 6000,
     "audio_bitrate": 160,
     "fps": 60,
     "output_width": 1920,
     "output_height": 1080,
+    "encoder": "nvenc_h264",
 }
 
 PICKER_MODULE_PATH = PACKAGE_DIR / "escolher-transmissao.py"
@@ -110,7 +141,7 @@ HTML = r"""<!doctype html>
     .settings-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 17px 19px; margin-bottom: 24px; }
     .settings-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
     .settings-body { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 16px; }
-    .settings-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
     .field { display: grid; gap: 7px; color: #dce2ee; font-size: 13px; font-weight: 700; }
     .field small { color: var(--muted); font-weight: 500; }
     .field input, .field select { width: 100%; background: #0d1119; color: #fff; border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; outline: none; }
@@ -171,8 +202,9 @@ HTML = r"""<!doctype html>
           <label class="field">Áudio <small>kbps</small><input id="audioBitrate" type="number" min="64" max="320" step="16" inputmode="numeric"></label>
           <label class="field">Quadros <small>por segundo</small><select id="fps"><option value="60">60 FPS</option><option value="30">30 FPS</option></select></label>
           <label class="field">Saída <small>resolução</small><select id="resolution"><option value="1920x1080">1920 × 1080</option><option value="1280x720">1280 × 720</option></select></label>
+          <label class="field">Encoder <small>vídeo</small><select id="encoder"></select></label>
         </div>
-        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
+        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
     </section>
     <nav class="tabs"><button class="tab active" data-tab="windows">Janelas abertas</button><button class="tab" data-tab="screen">Tela inteira</button></nav>
@@ -187,8 +219,16 @@ HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     function setStatus(text, kind='') { const el = $('status'); el.textContent = text || ''; el.className = 'status ' + kind; }
+    function syncEncoderOptions() {
+      const select = $('encoder');
+      const selected = (state.settings || {}).encoder || select.value;
+      const options = state.encoders || [];
+      select.innerHTML = options.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('');
+      if (selected && options.some(item => item.id === selected)) select.value = selected;
+    }
     function syncSettingsFields() {
       const settings = state.settings || {};
+      syncEncoderOptions();
       if (settings.video_bitrate) {
         const mbps = Number(settings.video_bitrate) / 1000;
         $('videoBitrate').value = Number.isInteger(mbps) ? String(mbps) : mbps.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
@@ -196,6 +236,7 @@ HTML = r"""<!doctype html>
       if (settings.audio_bitrate) $('audioBitrate').value = settings.audio_bitrate;
       if (settings.fps) $('fps').value = settings.fps;
       if (settings.output_width && settings.output_height) $('resolution').value = `${settings.output_width}x${settings.output_height}`;
+      if (settings.encoder) $('encoder').value = settings.encoder;
     }
     function readSettingsFields() {
       const [output_width, output_height] = $('resolution').value.split('x').map(Number);
@@ -205,13 +246,14 @@ HTML = r"""<!doctype html>
         fps: Number($('fps').value),
         output_width,
         output_height,
+        encoder: $('encoder').value,
       };
     }
     function refreshSettingsDirty() {
       const current = readSettingsFields();
       const saved = state.settings || {};
-      const fields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = fields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]);
+      const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder;
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -222,6 +264,7 @@ HTML = r"""<!doctype html>
       $('stopButton').disabled = !active;
       $('stopButton').textContent = active ? '■ Parar transmissão' : '■ Não está transmitindo';
       $('stopButton').className = active ? 'button danger' : 'button stop-disabled';
+      $('settingsFileHint').textContent = state.settings_file ? `Arquivo local: ${state.settings_file}` : 'As configurações serão salvas localmente.';
       if (syncSettings) syncSettingsFields();
       refreshSettingsDirty();
       const q = ($('search').value || '').toLowerCase();
@@ -249,6 +292,7 @@ HTML = r"""<!doctype html>
         fps: Number($('fps').value),
         output_width,
         output_height,
+        encoder: $('encoder').value,
       }, true);
     }
     async function share(path, payload, syncSettings = false) { setStatus(path === '/api/settings' ? 'Salvando ajustes no OBS...' : 'Preparando o OBS...', ''); try { const response = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Falha desconhecida'); state = data; if (syncSettings) { settingsDirty = false; $('settingsDirty').hidden = true; } render(syncSettings); setStatus(data.message || 'Transmissão atualizada.', 'ok'); } catch (e) { setStatus(e.message, 'error'); } }
@@ -260,6 +304,7 @@ HTML = r"""<!doctype html>
     $('settingsToggle').addEventListener('click', () => { const body = $('settingsBody'); body.hidden = !body.hidden; $('settingsToggle').textContent = body.hidden ? 'Mostrar ajustes' : 'Ocultar ajustes'; });
     $('saveSettings').addEventListener('click', saveSettings);
     ['videoBitrate', 'audioBitrate', 'fps', 'resolution'].forEach(id => $(id).addEventListener('input', refreshSettingsDirty));
+    $('encoder').addEventListener('change', refreshSettingsDirty);
     $('search').addEventListener('input', render);
     document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { activeTab = tab.dataset.tab; document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab)); $('windowsPanel').hidden = activeTab !== 'windows'; $('screenPanel').hidden = activeTab !== 'screen'; if (activeTab === 'screen') render(); }));
     load();
@@ -474,22 +519,54 @@ class PanelApp:
         return self.obs
 
     @staticmethod
-    def load_settings_file():
-        if not SETTINGS_FILE.exists():
-            return None
-        try:
-            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return PanelApp.validate_settings(data)
-        except Exception:
-            return None
+    def encoder_id_from_obs(value):
+        for encoder_id, option in ENCODER_OPTIONS.items():
+            if option["obs_value"] == value:
+                return encoder_id
+        return DEFAULT_SETTINGS["encoder"]
+
+    @staticmethod
+    def available_encoders():
+        plugin_dir = PICKER.ROOT / "obs-portable" / "app" / "obs-plugins" / "64bit"
+        available = []
+        for encoder_id, option in ENCODER_OPTIONS.items():
+            if option["plugin"] is None or (plugin_dir / option["plugin"]).exists():
+                available.append({"id": encoder_id, "label": option["label"]})
+        return available
+
+    def load_settings_file(self):
+        candidates = [SETTINGS_FILE]
+        if LEGACY_SETTINGS_FILE != SETTINGS_FILE:
+            candidates.append(LEGACY_SETTINGS_FILE)
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.settings_file = SETTINGS_FILE
+                return PanelApp.validate_settings(data)
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def settings_match(left, right):
         return all(left.get(name) == right.get(name) for name in DEFAULT_SETTINGS)
 
     def persist_settings(self, settings):
-        IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        content = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+        errors = []
+        for path in (SETTINGS_FILE, LEGACY_SETTINGS_FILE):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_name(f".{path.name}.tmp")
+                temporary.write_text(content, encoding="utf-8")
+                temporary.replace(path)
+                self.settings_file = path
+                return
+            except OSError as error:
+                errors.append(f"{path}: {error}")
+        raise OSError("Não consegui salvar settings.json. " + " | ".join(errors))
 
     def current_state(self, message=""):
         if message:
@@ -510,6 +587,8 @@ class PanelApp:
             "viewer_url": self.viewer_url,
             "stream_active": active,
             "settings": settings,
+            "settings_file": str(getattr(self, "settings_file", SETTINGS_FILE)),
+            "encoders": self.available_encoders(),
             "source_mode": self.source_mode,
             "source_title": self.source_title,
             "watch_window": self.active_window_hwnd is not None,
@@ -552,9 +631,24 @@ class PanelApp:
             )
         except (TypeError, ValueError):
             pass
+        current_encoder = self.profile_value(
+            obs,
+            "SimpleOutput",
+            "StreamEncoder",
+            ENCODER_OPTIONS[DEFAULT_SETTINGS["encoder"]]["obs_value"],
+        )
+        settings["encoder"] = self.encoder_id_from_obs(current_encoder)
         return settings
 
     def apply_settings_to_obs(self, obs, settings):
+        obs.call(
+            "SetProfileParameter",
+            {
+                "parameterCategory": "SimpleOutput",
+                "parameterName": "StreamEncoder",
+                "parameterValue": ENCODER_OPTIONS[settings["encoder"]]["obs_value"],
+            },
+        )
         obs.call(
             "SetProfileParameter",
             {
@@ -709,7 +803,12 @@ class PanelApp:
             "fps": number("fps", 30, 60),
             "output_width": number("output_width", 1, 4096),
             "output_height": number("output_height", 1, 4096),
+            "encoder": payload.get("encoder", DEFAULT_SETTINGS["encoder"]),
         }
+        if settings["encoder"] not in ENCODER_OPTIONS:
+            raise ValueError("Encoder inválido.")
+        if settings["encoder"] not in {item["id"] for item in PanelApp.available_encoders()}:
+            raise ValueError("Esse encoder não está disponível nesta instalação do OBS.")
         if settings["fps"] not in {30, 60}:
             raise ValueError("FPS disponível: 30 ou 60.")
         if (settings["output_width"], settings["output_height"]) not in {
@@ -739,7 +838,9 @@ class PanelApp:
             message = (
                 f"Ajustes salvos: {settings['video_bitrate']} kbps de vídeo, "
                 f"{settings['audio_bitrate']} kbps de áudio, {settings['fps']} FPS, "
-                f"{settings['output_width']}×{settings['output_height']}."
+                f"{settings['output_width']}×{settings['output_height']}, "
+                f"{ENCODER_OPTIONS[settings['encoder']]['label']}. "
+                f"Arquivo: {self.settings_file}."
             )
             if was_active:
                 message += " A transmissão foi reiniciada."
