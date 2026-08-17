@@ -1,0 +1,59 @@
+{
+  "name": "Untitled",
+  "sources": [
+    {
+      "prev_ver": 537001984,
+      "name": "Scene",
+      "uuid": "1f27d8a6-5ca6-4a84-a1d7-5a4c4b7fb9b5",
+      "id": "scene",
+      "versioned_id": "scene",
+      "settings": {
+        "id_counter": 1,
+        "custom_size": false,
+        "items": []
+      },
+      "mixers": 0,
+      "sync": 0,
+      "flags": 0,
+      "volume": 1.0,
+      "balance": 0.5,
+      "enabled": true,
+      "muted": false,
+      "push-to-mute": false,
+      "push-to-mute-delay": 0,
+      "push-to-talk": false,
+      "push-to-talk-delay": 0,
+      "hotkeys": {
+        "OBSBasic.SelectScene": []
+      },
+      "deinterlace_mode": 0,
+      "deinterlace_field_order": 0,
+      "private_settings": {}
+    }
+  ],
+  "groups": [],
+  "scene_order": [
+    {
+      "name": "Scene"
+    }
+  ],
+  "current_scene": "Scene",
+  "current_program_scene": "Scene",
+  "canvases": [],
+  "current_transition": "Fade",
+  "transition_duration": 300,
+  "transitions": [],
+  "quick_transitions": [],
+  "saved_projectors": [],
+  "preview_locked": false,
+  "scaling_enabled": false,
+  "scaling_level": -60,
+  "scaling_off_x": 0.0,
+  "scaling_off_y": 0.0,
+  "modules": {},
+  "resolution": {
+    "x": 3840,
+    "y": 2160
+  },
+  "version": 2
+}

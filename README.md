@@ -1,0 +1,78 @@
+# VDO-Ninja Streamer
+
+A small Windows-only launcher around OBS and VDO-Ninja-style WHIP streaming.
+It gives the user a single portable app where they can choose an open window,
+a game, or an entire monitor, then share the generated viewer link.
+
+The supervisor and the panel are intentionally tied together: closing the
+supervisor is the safe stop action and also terminates the child OBS process.
+The panel captures game windows with Game Capture when possible, downscales to
+the configured output resolution, and can capture application audio while
+excluding known Discord process variants.
+
+## Using a release
+
+1. Download the latest Windows ZIP from the repository's **Releases** page.
+2. Extract it to a normal folder.
+3. Run `TRANSMITIR.cmd`.
+4. Open the panel, choose a window or monitor, and share the viewer link.
+5. Close the supervisor when finished; that stops the stream and bundled OBS.
+
+The release is portable and does not require a Python or .NET installation.
+
+## Building locally
+
+Requirements:
+
+- Windows x64
+- Python 3.13 or newer with `PyInstaller`, `Pillow`, and `websocket-client`
+- .NET 10 SDK
+- PowerShell 7 or Windows PowerShell
+
+Install the Python build dependencies, then run:
+
+```powershell
+python -m pip install pyinstaller Pillow websocket-client
+& .\packaging\build-release.ps1 -ArtifactVersion local
+```
+
+The script downloads the pinned OBS portable ZIP, verifies its SHA-256 hash,
+builds the Python panel and C# supervisor, creates a clean OBS configuration,
+and writes both a runnable folder and a ZIP under `release\`.
+
+The OBS version is pinned in `packaging\build-release.ps1` so a release is
+reproducible. Update that version and checksum deliberately when upgrading.
+
+## Making a GitHub release
+
+The workflow in `.github/workflows/release.yml` runs on a version tag. After
+creating the repository and pushing the default branch:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions then builds the Windows package and attaches the ZIP to the
+release automatically. The workflow also has a manual **Run workflow** option
+that accepts a tag name.
+
+## Repository layout
+
+```text
+src/                       Python panel, picker, and status window
+Program.cs                 Windows Job Object supervisor
+TRANSMITIR.cmd             Portable launcher
+packaging/build-release.ps1 Reproducible Windows package build
+packaging/obs-config/      Sanitized OBS profile templates
+.github/workflows/         Automatic tagged releases
+```
+
+The repository deliberately does not commit compiled binaries, personal OBS
+logs, viewer tokens, or the large portable OBS runtime. Those are assembled
+only for a release ZIP.
+
+## License
+
+The project's own source is MIT-licensed. The release also bundles OBS Studio;
+see `THIRD-PARTY-NOTICES.md` and the notices included by OBS.

@@ -1,0 +1,25 @@
+# Generated Python/build output
+__pycache__/
+*.py[cod]
+src/_build/
+build/
+dist/
+release/
+publish/
+bin/
+obj/
+
+# Local compiled package and portable OBS runtime
+_app/
+obs-portable/
+*.exe
+*.zip
+
+# Local editor/OS files
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
