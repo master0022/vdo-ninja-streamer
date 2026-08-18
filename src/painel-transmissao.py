@@ -952,7 +952,11 @@ class PanelApp:
         settings = {
             "video_bitrate": number("video_bitrate", 1000, 20000),
             "audio_bitrate": number("audio_bitrate", 64, 320),
-            "audio_boost": number("audio_boost", 100, 200),
+            "audio_boost": (
+                number("audio_boost", 100, 200)
+                if "audio_boost" in payload
+                else DEFAULT_SETTINGS["audio_boost"]
+            ),
             "fps": number("fps", 30, 60),
             "output_width": number("output_width", 1, 4096),
             "output_height": number("output_height", 1, 4096),
