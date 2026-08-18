@@ -14,9 +14,18 @@ excluding known Discord process variants.
 
 1. Download the latest Windows ZIP from the repository's **Releases** page.
 2. Extract it to a normal folder.
-3. Run `TRANSMITIR.cmd`.
+3. For `v0.2.0` and newer, run `StreamerV2.exe`; older `v0.1.x` packages use `TRANSMITIR.cmd`.
 4. Open the panel, choose a window or monitor, and share the viewer link.
-5. Close the supervisor when finished; that stops the stream and bundled OBS.
+5. Close the app when finished; that stops the stream pipeline.
+
+## v0.2.0 — GStreamer portable pipeline
+
+The `v0.2.0` release is the new self-contained GStreamer implementation in
+`v0.2-gstreamer/`. It bundles fixed WebView2 and GStreamer runtimes, so users
+do not need to install .NET, Python, WebView2, OBS, or GStreamer. It supports
+application-window capture, full-monitor capture, hardware H.264, HEVC and
+AV1 where exposed by the GPU/runtime, x264, and system audio with the Discord
+process tree excluded.
 
 The panel exposes the available OBS video encoders from the bundled runtime,
 including NVENC H.264, NVENC HEVC, NVENC AV1, QuickSync, and x264 when present.
@@ -75,9 +84,16 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-GitHub Actions then builds the Windows package and attaches the ZIP to the
-release automatically. The workflow also has a manual **Run workflow** option
-that accepts a tag name.
+For the new pipeline, use `v0.2.0`:
+
+```powershell
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GitHub Actions selects the matching builder and attaches the portable ZIP to
+the release automatically. The workflow also has a manual **Run workflow**
+option that accepts a tag name.
 
 ## Repository layout
 
@@ -86,6 +102,7 @@ src/                       Python panel, picker, and status window
 Program.cs                 Windows Job Object supervisor
 TRANSMITIR.cmd             Portable launcher
 packaging/build-release.ps1 Reproducible Windows package build
+v0.2-gstreamer/             GStreamer/WebView2 portable v0.2 pipeline
 packaging/obs-config/      Sanitized OBS profile templates
 .github/workflows/         Automatic tagged releases
 ```

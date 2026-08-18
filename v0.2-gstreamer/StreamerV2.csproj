@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="GstSharpBundle" Version="1.24.3-preview6" />
+    <PackageReference Include="GstSharpBundle.Windows.X64" Version="1.24.3-preview6" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" />
+    <PackageReference Include="WebView2.Runtime.X64" Version="151.0.4129.93" GeneratePathProperty="true" PrivateAssets="all" IncludeAssets="None" />
+  </ItemGroup>
+
+  <Target Name="CopyFixedWebView2Runtime" AfterTargets="Publish">
+    <ItemGroup>
+      <FixedWebView2Files Include="$(PkgWebView2_Runtime_X64)\contentFiles\any\any\WebView2\**\*" />
+    </ItemGroup>
+    <Error Condition="@(FixedWebView2Files->Count()) == 0" Text="WebView2 fixed runtime package was not restored correctly." />
+    <Copy SourceFiles="@(FixedWebView2Files)"
+          DestinationFiles="@(FixedWebView2Files->'$(PublishDir)WebView2\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!--
+    GstSharpBundle still supplies the managed binding and a 1.24 native
+    runtime. Releases pass GStreamerRuntimeSource so the published package
+    receives the official newer runtime with NVENC AV1 support instead of
+    silently reverting to the old bundle.
+  -->
+  <Target Name="CopyPortableGStreamerRuntime"
+          AfterTargets="Publish"
+          Condition="'$(GStreamerRuntimeSource)' != ''">
+    <Error Condition="!Exists('$(GStreamerRuntimeSource)')"
+           Text="GStreamerRuntimeSource does not exist: $(GStreamerRuntimeSource)" />
+    <ItemGroup>
+      <PortableGStreamerFiles Include="$(GStreamerRuntimeSource)\**\*"
+                               Exclude="$(GStreamerRuntimeSource)\unins000.exe;$(GStreamerRuntimeSource)\unins000.dat" />
+    </ItemGroup>
+    <RemoveDir Directories="$(PublishDir)gstreamer\win-x64" />
+    <MakeDir Directories="$(PublishDir)gstreamer\win-x64" />
+    <Copy SourceFiles="@(PortableGStreamerFiles)"
+          DestinationFiles="@(PortableGStreamerFiles->'$(PublishDir)gstreamer\win-x64\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

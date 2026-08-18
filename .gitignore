@@ -17,6 +17,8 @@ obs-portable/
 *.zip
 settings.json
 .*.tmp
+v0.2-gstreamer/release-organized/
+v0.2-gstreamer/WebView2Data/
 
 # Local editor/OS files
 .vs/
