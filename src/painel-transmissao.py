@@ -84,6 +84,17 @@ DEFAULT_SETTINGS = {
     "output_height": 1080,
     "encoder": "nvenc_h264",
     "scale_filter": "auto",
+    "webrtc_x264_profile": False,
+}
+X264_WEBRTC_SETTINGS = {
+    "RateControl": "CRF",
+    "CRF": "23",
+    "KeyintSec": "1",
+    "Preset": "veryfast",
+    "Profile": "high",
+    "Tune": "fastdecode",
+    "x264opts": "bframes=0",
+    "ApplyServiceSettings": "false",
 }
 
 PICKER_MODULE_PATH = PACKAGE_DIR / "escolher-transmissao.py"
@@ -211,8 +222,9 @@ HTML = r"""<!doctype html>
           <label class="field">Saída <small>resolução</small><select id="resolution"><option value="1920x1080">1920 × 1080</option><option value="1280x720">1280 × 720</option></select></label>
           <label class="field">Encoder <small>vídeo</small><select id="encoder"></select></label>
           <label class="field">Redimensionamento <small>filtro</small><select id="scaleFilter"><option value="auto">Automático (leve em 720p)</option><option value="lanczos">Lanczos (máxima nitidez)</option><option value="bicubic">Bicubic (equilibrado)</option><option value="none">Nenhum (canvas = saída)</option></select></label>
+          <label class="field">Perfil WebRTC <small>x264 opcional</small><select id="webrtcProfile"><option value="off">Desligado (configuração normal)</option><option value="x264">x264 · CRF 23 · 1s · Veryfast</option></select></label>
         </div>
-        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
+        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
     </section>
     <nav class="tabs"><button class="tab active" data-tab="windows">Janelas abertas</button><button class="tab" data-tab="screen">Tela inteira</button></nav>
@@ -246,6 +258,13 @@ HTML = r"""<!doctype html>
       if (settings.output_width && settings.output_height) $('resolution').value = `${settings.output_width}x${settings.output_height}`;
       if (settings.encoder) $('encoder').value = settings.encoder;
       if (settings.scale_filter) $('scaleFilter').value = settings.scale_filter;
+      $('webrtcProfile').value = settings.webrtc_x264_profile ? 'x264' : 'off';
+      syncWebrtcProfile();
+    }
+    function syncWebrtcProfile() {
+      const enabled = $('webrtcProfile').value === 'x264';
+      if (enabled && [...$('encoder').options].some(option => option.value === 'x264')) $('encoder').value = 'x264';
+      $('encoder').disabled = enabled;
     }
     function readSettingsFields() {
       const [output_width, output_height] = $('resolution').value.split('x').map(Number);
@@ -257,13 +276,14 @@ HTML = r"""<!doctype html>
         output_height,
         encoder: $('encoder').value,
         scale_filter: $('scaleFilter').value,
+        webrtc_x264_profile: $('webrtcProfile').value === 'x264',
       };
     }
     function refreshSettingsDirty() {
       const current = readSettingsFields();
       const saved = state.settings || {};
       const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter;
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile);
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -304,6 +324,7 @@ HTML = r"""<!doctype html>
         output_height,
         encoder: $('encoder').value,
         scale_filter: $('scaleFilter').value,
+        webrtc_x264_profile: $('webrtcProfile').value === 'x264',
       }, true);
     }
     async function share(path, payload, syncSettings = false) { setStatus(path === '/api/settings' ? 'Salvando ajustes no OBS...' : 'Preparando o OBS...', ''); try { const response = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Falha desconhecida'); state = data; if (syncSettings) { settingsDirty = false; $('settingsDirty').hidden = true; } render(syncSettings); setStatus(data.message || 'Transmissão atualizada.', 'ok'); } catch (e) { setStatus(e.message, 'error'); } }
@@ -315,8 +336,9 @@ HTML = r"""<!doctype html>
     $('settingsToggle').addEventListener('click', () => { const body = $('settingsBody'); body.hidden = !body.hidden; $('settingsToggle').textContent = body.hidden ? 'Mostrar ajustes' : 'Ocultar ajustes'; });
     $('saveSettings').addEventListener('click', saveSettings);
     ['videoBitrate', 'audioBitrate', 'fps', 'resolution'].forEach(id => $(id).addEventListener('input', refreshSettingsDirty));
-    $('encoder').addEventListener('change', refreshSettingsDirty);
+    $('encoder').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
     $('scaleFilter').addEventListener('change', refreshSettingsDirty);
+    $('webrtcProfile').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
     $('search').addEventListener('input', render);
     document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { activeTab = tab.dataset.tab; document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab)); $('windowsPanel').hidden = activeTab !== 'windows'; $('screenPanel').hidden = activeTab !== 'screen'; if (activeTab === 'screen') render(); }));
     load();
@@ -620,6 +642,22 @@ class PanelApp:
         except Exception:
             return fallback
 
+    @classmethod
+    def x264_webrtc_profile_matches(cls, obs):
+        if str(cls.profile_value(obs, "Output", "Mode", "")).casefold() != "advanced":
+            return False
+        if str(cls.profile_value(obs, "AdvOut", "Encoder", "")).casefold() != "obs_x264":
+            return False
+        for name, expected in X264_WEBRTC_SETTINGS.items():
+            actual = str(cls.profile_value(obs, "AdvOut", name, "")).strip().casefold()
+            wanted = str(expected).strip().casefold()
+            if name == "x264opts":
+                actual = actual.replace(" ", "")
+                wanted = wanted.replace(" ", "")
+            if actual != wanted:
+                return False
+        return True
+
     @staticmethod
     def canvas_for_settings(settings):
         scale_filter = settings.get("scale_filter", DEFAULT_SETTINGS["scale_filter"])
@@ -657,6 +695,10 @@ class PanelApp:
             return False
         if cls.profile_value(obs, "Video", "ScaleType", "") != cls.scale_type_for_settings(settings):
             return False
+        if settings.get("webrtc_x264_profile", False):
+            return cls.x264_webrtc_profile_matches(obs)
+        if str(cls.profile_value(obs, "Output", "Mode", "Simple")).casefold() != "simple":
+            return False
         expected_preset = cls.nvenc_preset_for_settings(settings)
         if expected_preset and cls.profile_value(obs, "SimpleOutput", "NVENCPreset2", "") != expected_preset:
             return False
@@ -685,13 +727,18 @@ class PanelApp:
             )
         except (TypeError, ValueError):
             pass
-        current_encoder = self.profile_value(
-            obs,
-            "SimpleOutput",
-            "StreamEncoder",
-            ENCODER_OPTIONS[DEFAULT_SETTINGS["encoder"]]["obs_value"],
-        )
+        output_mode = str(self.profile_value(obs, "Output", "Mode", "Simple")).casefold()
+        if output_mode == "advanced":
+            current_encoder = self.profile_value(obs, "AdvOut", "Encoder", "")
+        else:
+            current_encoder = self.profile_value(
+                obs,
+                "SimpleOutput",
+                "StreamEncoder",
+                ENCODER_OPTIONS[DEFAULT_SETTINGS["encoder"]]["obs_value"],
+            )
         settings["encoder"] = self.encoder_id_from_obs(current_encoder)
+        settings["webrtc_x264_profile"] = self.x264_webrtc_profile_matches(obs)
         current_scale = self.profile_value(obs, "Video", "ScaleType", "")
         settings["scale_filter"] = {
             "lanczos": "lanczos",
@@ -702,6 +749,25 @@ class PanelApp:
 
     def apply_settings_to_obs(self, obs, settings):
         canvas_width, canvas_height = self.canvas_for_settings(settings)
+        if settings.get("webrtc_x264_profile", False):
+            obs.call(
+                "SetProfileParameter",
+                {"parameterCategory": "Output", "parameterName": "Mode", "parameterValue": "Advanced"},
+            )
+            for name, value in X264_WEBRTC_SETTINGS.items():
+                obs.call(
+                    "SetProfileParameter",
+                    {
+                        "parameterCategory": "AdvOut",
+                        "parameterName": name,
+                        "parameterValue": value,
+                    },
+                )
+        else:
+            obs.call(
+                "SetProfileParameter",
+                {"parameterCategory": "Output", "parameterName": "Mode", "parameterValue": "Simple"},
+            )
         obs.call(
             "SetProfileParameter",
             {
@@ -753,6 +819,15 @@ class PanelApp:
                     "parameterCategory": "SimpleOutput",
                     "parameterName": "NVENCPreset2",
                     "parameterValue": expected_preset,
+                },
+            )
+        elif settings["encoder"] == "x264" and not settings.get("webrtc_x264_profile", False):
+            obs.call(
+                "SetProfileParameter",
+                {
+                    "parameterCategory": "SimpleOutput",
+                    "parameterName": "Preset",
+                    "parameterValue": "veryfast",
                 },
             )
 
@@ -876,6 +951,7 @@ class PanelApp:
             "output_height": number("output_height", 1, 4096),
             "encoder": payload.get("encoder", DEFAULT_SETTINGS["encoder"]),
             "scale_filter": payload.get("scale_filter", DEFAULT_SETTINGS["scale_filter"]),
+            "webrtc_x264_profile": payload.get("webrtc_x264_profile", DEFAULT_SETTINGS["webrtc_x264_profile"]),
         }
         if settings["encoder"] not in ENCODER_OPTIONS:
             raise ValueError("Encoder inválido.")
@@ -883,6 +959,10 @@ class PanelApp:
             raise ValueError("Esse encoder não está disponível nesta instalação do OBS.")
         if settings["scale_filter"] not in SCALE_FILTER_OPTIONS:
             raise ValueError("Filtro de redimensionamento inválido.")
+        if not isinstance(settings["webrtc_x264_profile"], bool):
+            raise ValueError("Perfil WebRTC inválido.")
+        if settings["webrtc_x264_profile"] and settings["encoder"] != "x264":
+            raise ValueError("O perfil WebRTC opcional usa o encoder x264.")
         if settings["fps"] not in {30, 60}:
             raise ValueError("FPS disponível: 30 ou 60.")
         if (settings["output_width"], settings["output_height"]) not in {
@@ -917,6 +997,8 @@ class PanelApp:
                 f"{SCALE_FILTER_OPTIONS[settings['scale_filter']]}. "
                 f"Arquivo: {self.settings_file}."
             )
+            if settings.get("webrtc_x264_profile", False):
+                message += " Perfil x264 WebRTC ativo: CRF 23, keyframe 1s, fastdecode e bframes=0."
             if was_active:
                 message += " A transmissão foi reiniciada."
             return self.current_state(message)
