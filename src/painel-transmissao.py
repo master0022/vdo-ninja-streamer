@@ -79,6 +79,7 @@ SCALE_FILTER_OPTIONS = {
 DEFAULT_SETTINGS = {
     "video_bitrate": 6000,
     "audio_bitrate": 160,
+    "audio_boost": 100,
     "fps": 60,
     "output_width": 1920,
     "output_height": 1080,
@@ -218,13 +219,14 @@ HTML = r"""<!doctype html>
         <div class="settings-grid">
           <label class="field">Vídeo <small>Mbps</small><input id="videoBitrate" type="number" min="1" max="20" step="0.5" inputmode="decimal"></label>
           <label class="field">Áudio <small>kbps</small><input id="audioBitrate" type="number" min="64" max="320" step="16" inputmode="numeric"></label>
+          <label class="field">Ganho do áudio <small>som transmitido</small><select id="audioBoost"><option value="100">100% (normal)</option><option value="125">125%</option><option value="150">150%</option><option value="175">175%</option><option value="200">200% (dobro)</option></select></label>
           <label class="field">Quadros <small>por segundo</small><select id="fps"><option value="60">60 FPS</option><option value="30">30 FPS</option></select></label>
           <label class="field">Saída <small>resolução</small><select id="resolution"><option value="1920x1080">1920 × 1080</option><option value="1280x720">1280 × 720</option></select></label>
           <label class="field">Encoder <small>vídeo</small><select id="encoder"></select></label>
           <label class="field">Redimensionamento <small>filtro</small><select id="scaleFilter"><option value="auto">Automático (leve em 720p)</option><option value="lanczos">Lanczos (máxima nitidez)</option><option value="bicubic">Bicubic (equilibrado)</option><option value="none">Nenhum (canvas = saída)</option></select></label>
           <label class="field">Perfil WebRTC <small>x264 opcional</small><select id="webrtcProfile"><option value="off">Desligado (configuração normal)</option><option value="x264">x264 · CRF 23 · 1s · Veryfast</option></select></label>
         </div>
-        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
+        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O ganho afeta somente o áudio capturado para a transmissão, não o volume do seu headset. Acima de 100% pode distorcer se o jogo já estiver alto.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
     </section>
     <nav class="tabs"><button class="tab active" data-tab="windows">Janelas abertas</button><button class="tab" data-tab="screen">Tela inteira</button></nav>
@@ -254,6 +256,7 @@ HTML = r"""<!doctype html>
         $('videoBitrate').value = Number.isInteger(mbps) ? String(mbps) : mbps.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
       }
       if (settings.audio_bitrate) $('audioBitrate').value = settings.audio_bitrate;
+      if (settings.audio_boost) $('audioBoost').value = settings.audio_boost;
       if (settings.fps) $('fps').value = settings.fps;
       if (settings.output_width && settings.output_height) $('resolution').value = `${settings.output_width}x${settings.output_height}`;
       if (settings.encoder) $('encoder').value = settings.encoder;
@@ -271,6 +274,7 @@ HTML = r"""<!doctype html>
       return {
         video_bitrate: Math.round(Number($('videoBitrate').value) * 1000),
         audio_bitrate: Number($('audioBitrate').value),
+        audio_boost: Number($('audioBoost').value),
         fps: Number($('fps').value),
         output_width,
         output_height,
@@ -283,7 +287,7 @@ HTML = r"""<!doctype html>
       const current = readSettingsFields();
       const saved = state.settings || {};
       const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile);
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.audio_boost !== Number(saved.audio_boost || 100) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile);
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -319,6 +323,7 @@ HTML = r"""<!doctype html>
       await share('/api/settings', {
         video_bitrate: Math.round(video_mbps * 1000),
         audio_bitrate: Number($('audioBitrate').value),
+        audio_boost: Number($('audioBoost').value),
         fps: Number($('fps').value),
         output_width,
         output_height,
@@ -335,7 +340,8 @@ HTML = r"""<!doctype html>
     $('stopButton').addEventListener('click', stopStream);
     $('settingsToggle').addEventListener('click', () => { const body = $('settingsBody'); body.hidden = !body.hidden; $('settingsToggle').textContent = body.hidden ? 'Mostrar ajustes' : 'Ocultar ajustes'; });
     $('saveSettings').addEventListener('click', saveSettings);
-    ['videoBitrate', 'audioBitrate', 'fps', 'resolution'].forEach(id => $(id).addEventListener('input', refreshSettingsDirty));
+    ['videoBitrate', 'audioBitrate', 'audioBoost', 'fps', 'resolution'].forEach(id => $(id).addEventListener('input', refreshSettingsDirty));
+    $('audioBoost').addEventListener('change', refreshSettingsDirty);
     $('encoder').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
     $('scaleFilter').addEventListener('change', refreshSettingsDirty);
     $('webrtcProfile').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
@@ -663,9 +669,7 @@ class PanelApp:
         scale_filter = settings.get("scale_filter", DEFAULT_SETTINGS["scale_filter"])
         if scale_filter == "none":
             return settings["output_width"], settings["output_height"]
-        if scale_filter == "bicubic" and settings["output_width"] <= 1280 and settings["output_height"] <= 720:
-            return 1920, 1080
-        if scale_filter == "auto" and settings["output_width"] <= 1280 and settings["output_height"] <= 720:
+        if scale_filter in {"auto", "bicubic"} and settings["output_width"] <= 1280 and settings["output_height"] <= 720:
             return settings["output_width"], settings["output_height"]
         return 3840, 2160
 
@@ -836,6 +840,7 @@ class PanelApp:
             self.saved_settings = self.current_settings(obs)
             self.persist_settings(self.saved_settings)
             self.apply_settings_to_obs(obs, self.saved_settings)
+            PICKER.apply_picker_audio_volume(obs, self.saved_settings["audio_boost"] / 100)
             return
         actual = self.current_settings(obs)
         if self.settings_match(actual, self.saved_settings) and self.tuning_matches(obs, self.saved_settings):
@@ -843,6 +848,7 @@ class PanelApp:
         was_active = self.stop_output(obs)
         try:
             self.apply_settings_to_obs(obs, self.saved_settings)
+            PICKER.apply_picker_audio_volume(obs, self.saved_settings["audio_boost"] / 100)
         except Exception:
             if was_active:
                 obs.call("StartStream")
@@ -946,6 +952,7 @@ class PanelApp:
         settings = {
             "video_bitrate": number("video_bitrate", 1000, 20000),
             "audio_bitrate": number("audio_bitrate", 64, 320),
+            "audio_boost": number("audio_boost", 100, 200),
             "fps": number("fps", 30, 60),
             "output_width": number("output_width", 1, 4096),
             "output_height": number("output_height", 1, 4096),
@@ -979,6 +986,7 @@ class PanelApp:
             was_active = self.stop_output(obs)
             try:
                 self.apply_settings_to_obs(obs, settings)
+                PICKER.apply_picker_audio_volume(obs, settings["audio_boost"] / 100)
             except Exception:
                 if was_active:
                     obs.call("StartStream")
@@ -993,6 +1001,7 @@ class PanelApp:
                 f"Ajustes salvos: {settings['video_bitrate']} kbps de vídeo, "
                 f"{settings['audio_bitrate']} kbps de áudio, {settings['fps']} FPS, "
                 f"{settings['output_width']}×{settings['output_height']}, "
+                f"ganho de áudio {settings['audio_boost']}%, "
                 f"{ENCODER_OPTIONS[settings['encoder']]['label']}, "
                 f"{SCALE_FILTER_OPTIONS[settings['scale_filter']]}. "
                 f"Arquivo: {self.settings_file}."
@@ -1026,6 +1035,7 @@ class PanelApp:
             PICKER.remove_picker_audio_inputs(obs)
             input_kind, input_settings = PICKER.capture_settings_for_window(window)
             item = PICKER.ensure_input(obs, PICKER.PICKER_VIDEO, input_kind, input_settings)
+            PICKER.set_input_volume(obs, PICKER.PICKER_VIDEO, self.saved_settings["audio_boost"] / 100)
             PICKER.set_enabled(obs, PICKER.PICKER_VIDEO, True)
             PICKER.fit_source(obs, item)
             PICKER.start_if_needed(obs)
@@ -1056,12 +1066,15 @@ class PanelApp:
                     "force_sdr": False,
                 },
             )
+            PICKER.set_input_volume(obs, PICKER.PICKER_VIDEO, self.saved_settings["audio_boost"] / 100)
             PICKER.set_enabled(obs, PICKER.PICKER_VIDEO, True)
             PICKER.fit_source(obs, item)
             audio_note = "sem áudio"
             if audio:
                 preferred = self.find_window(hwnd) if hwnd else None
-                audio_sources = PICKER.configure_audio_without_discord(obs, preferred)
+                audio_sources = PICKER.configure_audio_without_discord(
+                    obs, preferred, self.saved_settings["audio_boost"] / 100
+                )
                 audio_note = f"áudio de apps, exceto Discord ({len(audio_sources)} fontes)"
             else:
                 PICKER.remove_picker_audio_inputs(obs)

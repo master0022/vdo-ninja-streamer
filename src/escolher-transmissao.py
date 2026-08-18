@@ -502,6 +502,25 @@ def remove_picker_audio_inputs(obs):
             remove_input(obs, name)
 
 
+def set_input_volume(obs, source_name, multiplier):
+    """Set the OBS source volume multiplier without touching the local playback device."""
+    obs.call(
+        "SetInputVolume",
+        {
+            "inputName": source_name,
+            "inputVolumeMul": max(1.0, min(2.0, float(multiplier))),
+        },
+    )
+
+
+def apply_picker_audio_volume(obs, multiplier):
+    """Apply gain to only the sources created by this app for the broadcast."""
+    for current in obs.call("GetInputList").get("inputs", []):
+        name = current.get("inputName", "")
+        if name == PICKER_VIDEO or name.startswith(PICKER_AUDIO_PREFIX + " -"):
+            set_input_volume(obs, name, multiplier)
+
+
 def likely_game_window(window):
     executable = window.get("exe", "").lower()
     window_class = window.get("class", "").lower()
@@ -545,7 +564,7 @@ def capture_settings_for_window(window):
     }
 
 
-def configure_audio_without_discord(obs, preferred_window=None):
+def configure_audio_without_discord(obs, preferred_window=None, volume_multiplier=1.0):
     remove_picker_audio_inputs(obs)
     candidates = {}
     windows = ([preferred_window] if preferred_window else []) + enumerate_windows()
@@ -567,6 +586,7 @@ def configure_audio_without_discord(obs, preferred_window=None):
             "wasapi_process_output_capture",
             {"window": window["spec"], "priority": 1},
         )
+        set_input_volume(obs, source_name, volume_multiplier)
         set_enabled(obs, source_name, True)
         created.append(source_name)
     return created

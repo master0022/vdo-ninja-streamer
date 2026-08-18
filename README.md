@@ -28,6 +28,9 @@ In automatic mode, 1280×720 output uses a matching canvas, Bicubic scaling, and
 NVENC P4 to reduce render and encoder pressure on older GPUs. The panel also
 offers an explicit Lanczos option for 4K-to-720p text sharpness, plus Bicubic
 and no-filter modes for machines whose source is already 1080p or 720p.
+For 720p, Auto and Bicubic keep the OBS canvas at the output size to reduce GPU
+work on older machines. The audio gain control affects only captured audio sent
+to viewers and can boost it up to 200% without changing headset volume.
 The optional WebRTC x264 profile switches OBS to Advanced output with CRF 23,
 1-second keyframes, veryfast, High, fastdecode, and `bframes=0`; it is disabled
 by default so AV1/NVENC behavior remains unchanged.
