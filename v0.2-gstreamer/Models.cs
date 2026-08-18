@@ -54,4 +54,5 @@ public sealed record StreamSettings(
     int Crf = 23,
     VideoSourceKind VideoSource = VideoSourceKind.Window,
     int MonitorIndex = -1,
-    AudioSourceKind AudioSource = AudioSourceKind.SelectedProcess);
+    AudioSourceKind AudioSource = AudioSourceKind.SelectedProcess,
+    int SettingsVersion = 2);

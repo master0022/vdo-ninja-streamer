@@ -6,7 +6,8 @@ Implementação isolada da próxima versão do streamer. A versão existente em 
 
 - Execute `StreamerV2.exe` sem argumentos para abrir a UI HTML escura hospedada pelo WebView2.
 - A UI é English-only, lista janelas visíveis e monitores, guarda `HWND + PID` ou índice de monitor, salva `settings-v02.json` no próprio diretório e mantém `Start streaming`/`Stop stream` no mesmo processo.
-- A stream key fica visível porque ela é deliberadamente o slug do link; a UI mostra o viewer link clicável e tem botões separados para copiar a key e o link.
+- O áudio da janela é sempre isolado pelo processo escolhido; somente o modo de monitor inteiro usa o áudio global com Discord excluído. O ganho aparece como percentual na UI: 100% é normal e 200% é o padrão.
+- A stream key fica salva localmente em `settings-v02.json`; a UI mostra o viewer link clicável, oferece `Copy link` e só libera a troca da key pelo botão `Change stream key`.
 - A stream só existe enquanto o processo do app mantém o pipeline GStreamer vivo. Ao fechar o app, a UI cancela e aguarda o pipeline chegar a `NULL` antes de sair.
 - O link de viewer é `https://b.siobud.com/<stream-key>`; o endpoint padrão é `https://b.siobud.com/api/whip`.
 

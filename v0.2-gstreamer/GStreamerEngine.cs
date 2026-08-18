@@ -348,7 +348,9 @@ public sealed class GStreamerEngine : IDisposable
 
     private static void SetAudioLoopback(Element audio, WindowTarget target, StreamSettings settings)
     {
-        if (settings.AudioSource == AudioSourceKind.SystemExceptDiscord)
+        // Audio follows the video source by design: a window captures only its
+        // process tree; a monitor captures the system mix excluding Discord.
+        if (target.SourceKind == VideoSourceKind.Monitor)
         {
             var discordPid = WindowDiscovery.FindDiscordRootPid()
                 ?? throw new InvalidOperationException("Discord was not found. Start Discord first or choose Selected app audio.");
@@ -638,7 +640,7 @@ internal static class PipelineTextBuilder
 
     private static string AudioText(StreamSettings settings, WindowTarget target)
     {
-        if (settings.AudioSource == AudioSourceKind.SystemExceptDiscord)
+        if (target.SourceKind == VideoSourceKind.Monitor)
         {
             var discordPid = WindowDiscovery.FindDiscordRootPid()
                 ?? throw new InvalidOperationException("Discord was not found. Start Discord first or choose Selected app audio.");

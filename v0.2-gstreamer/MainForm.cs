@@ -27,7 +27,7 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(980, 720);
         ClientSize = new Size(1180, 860);
-        Icon = SystemIcons.Application;
+        Icon = LoadApplicationIcon();
         BackColor = Color.FromArgb(12, 15, 22);
 
         _settings = _settingsStore.LoadOrDefault(Presets.StableOldPc);
@@ -93,6 +93,9 @@ internal sealed class MainForm : Form
                 case "save":
                     SaveFromUi(root.GetProperty("settings"));
                     break;
+                case "save-key":
+                    SaveStreamKey(root);
+                    break;
                 case "start":
                     StartStream(root);
                     break;
@@ -145,6 +148,25 @@ internal sealed class MainForm : Form
         catch (Exception ex)
         {
             SetStatus("INVALID CONFIG", "error");
+            Log("Error: " + ex.Message);
+        }
+    }
+
+    private void SaveStreamKey(JsonElement root)
+    {
+        try
+        {
+            var token = String(root, "streamKey", _settings.BearerToken).Trim();
+            if (token.Length == 0) throw new InvalidOperationException("Stream key cannot be empty.");
+            _settings = _settings with { BearerToken = token, SettingsVersion = 2 };
+            _settingsStore.Save(_settings);
+            SetStatus("KEY SAVED", "success");
+            Log("Stream key saved locally.");
+            SendState();
+        }
+        catch (Exception ex)
+        {
+            SetStatus("INVALID KEY", "error");
             Log("Error: " + ex.Message);
         }
     }
@@ -305,6 +327,10 @@ internal sealed class MainForm : Form
         var token = String(value, "streamKey", _settings.BearerToken).Trim();
         if (!Uri.TryCreate(endpoint, UriKind.Absolute, out _)) throw new InvalidOperationException("WHIP endpoint is invalid.");
         if (requireToken && token.Length == 0) throw new InvalidOperationException("Enter a stream key before starting.");
+        var videoSource = EnumValue(value, "videoSource", _settings.VideoSource);
+        var audioSource = videoSource == VideoSourceKind.Monitor
+            ? AudioSourceKind.SystemExceptDiscord
+            : AudioSourceKind.SelectedProcess;
 
         return new StreamSettings(
             EnumValue(value, "encoder", _settings.Encoder),
@@ -326,9 +352,10 @@ internal sealed class MainForm : Form
             endpoint,
             token,
             Clamp(value, "crf", _settings.Crf, 0, 51),
-            EnumValue(value, "videoSource", _settings.VideoSource),
+            videoSource,
             Clamp(value, "monitorIndex", _settings.MonitorIndex, -1, 32),
-            EnumValue(value, "audioSource", _settings.AudioSource));
+            audioSource,
+            2);
     }
 
     private void SendState()
@@ -388,6 +415,18 @@ internal sealed class MainForm : Form
     private static void CopyToClipboard(string text)
     {
         if (text.Length > 0) Clipboard.SetText(text);
+    }
+
+    private static Icon LoadApplicationIcon()
+    {
+        try
+        {
+            return Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+        }
+        catch
+        {
+            return SystemIcons.Application;
+        }
     }
 
     private static void OpenExternal(string url)

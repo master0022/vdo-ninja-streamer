@@ -18,7 +18,7 @@ public static class PipelinePlanner
         text.AppendLine($"    -> D3D11/NV12 {settings.Width}x{settings.Height}@{settings.FramesPerSecond}");
         text.AppendLine($"    -> {settings.Encoder} {settings.RateControl} {settings.VideoBitrateKbps} kbps, " +
                         $"keyint={settings.KeyframeIntervalSeconds}s, preset={settings.EncoderPreset}, bframes={settings.BFrames}");
-        text.AppendLine(settings.AudioSource == AudioSourceKind.SystemExceptDiscord
+        text.AppendLine(target.SourceKind == VideoSourceKind.Monitor
             ? "Audio: wasapi2src(loopback-target-pid=<Discord root>, exclude-process-tree, low-latency)"
             : $"Audio: wasapi2src(loopback-target-pid={target.ProcessId}, include-process-tree, low-latency)");
         text.AppendLine($"    -> 48 kHz stereo, gain={settings.AudioGain:0.##}x, Opus={settings.AudioBitrateKbps} kbps");
