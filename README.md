@@ -31,6 +31,9 @@ and no-filter modes for machines whose source is already 1080p or 720p.
 For 720p, Auto and Bicubic keep the OBS canvas at the output size to reduce GPU
 work on older machines. The audio gain control affects only captured audio sent
 to viewers and can boost it up to 200% without changing headset volume.
+The Budget performance profile fixes a low-load 720p30 path with no scaling
+filter, the fastest NVENC preset available, limited game capture framerate, and
+only the selected app's audio when sharing the whole screen.
 The optional WebRTC x264 profile switches OBS to Advanced output with CRF 23,
 1-second keyframes, veryfast, High, fastdecode, and `bframes=0`; it is disabled
 by default so AV1/NVENC behavior remains unchanged.

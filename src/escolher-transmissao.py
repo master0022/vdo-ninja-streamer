@@ -535,7 +535,7 @@ def likely_game_window(window):
     )
 
 
-def capture_settings_for_window(window):
+def capture_settings_for_window(window, budget=False):
     if likely_game_window(window):
         return "game_capture", {
             "capture_mode": "window",
@@ -546,7 +546,7 @@ def capture_settings_for_window(window):
             "capture_overlays": False,
             "anti_cheat_hook": True,
             "hook_rate": 1,
-            "limit_framerate": False,
+            "limit_framerate": bool(budget),
             "allow_transparency": False,
             "premultiplied_alpha": False,
             "sli_compatibility": False,
@@ -564,10 +564,14 @@ def capture_settings_for_window(window):
     }
 
 
-def configure_audio_without_discord(obs, preferred_window=None, volume_multiplier=1.0):
+def configure_audio_without_discord(
+    obs, preferred_window=None, volume_multiplier=1.0, only_preferred=False
+):
     remove_picker_audio_inputs(obs)
     candidates = {}
-    windows = ([preferred_window] if preferred_window else []) + enumerate_windows()
+    windows = ([preferred_window] if preferred_window else [])
+    if not only_preferred:
+        windows += enumerate_windows()
     for window in windows:
         if not window:
             continue

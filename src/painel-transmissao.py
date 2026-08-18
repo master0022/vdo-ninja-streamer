@@ -76,6 +76,10 @@ SCALE_FILTER_OPTIONS = {
     "bicubic": "Bicubic (equilibrado)",
     "none": "Nenhum (canvas = saída)",
 }
+PERFORMANCE_MODE_OPTIONS = {
+    "normal": "Normal (ajustes manuais)",
+    "budget": "Budget (720p30 · leve)",
+}
 DEFAULT_SETTINGS = {
     "video_bitrate": 6000,
     "audio_bitrate": 160,
@@ -86,6 +90,7 @@ DEFAULT_SETTINGS = {
     "encoder": "nvenc_h264",
     "scale_filter": "auto",
     "webrtc_x264_profile": False,
+    "performance_mode": "normal",
 }
 X264_WEBRTC_SETTINGS = {
     "RateControl": "CRF",
@@ -96,6 +101,15 @@ X264_WEBRTC_SETTINGS = {
     "Tune": "fastdecode",
     "x264opts": "bframes=0",
     "ApplyServiceSettings": "false",
+}
+BUDGET_SETTINGS = {
+    "video_bitrate": 2000,
+    "audio_bitrate": 128,
+    "fps": 30,
+    "output_width": 1280,
+    "output_height": 720,
+    "scale_filter": "none",
+    "webrtc_x264_profile": False,
 }
 
 PICKER_MODULE_PATH = PACKAGE_DIR / "escolher-transmissao.py"
@@ -225,8 +239,9 @@ HTML = r"""<!doctype html>
           <label class="field">Encoder <small>vídeo</small><select id="encoder"></select></label>
           <label class="field">Redimensionamento <small>filtro</small><select id="scaleFilter"><option value="auto">Automático (leve em 720p)</option><option value="lanczos">Lanczos (máxima nitidez)</option><option value="bicubic">Bicubic (equilibrado)</option><option value="none">Nenhum (canvas = saída)</option></select></label>
           <label class="field">Perfil WebRTC <small>x264 opcional</small><select id="webrtcProfile"><option value="off">Desligado (configuração normal)</option><option value="x264">x264 · CRF 23 · 1s · Veryfast</option></select></label>
+          <label class="field">Desempenho <small>perfil</small><select id="performanceMode"><option value="normal">Normal (ajustes manuais)</option><option value="budget">Budget (720p30 · leve)</option></select></label>
         </div>
-        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O ganho afeta somente o áudio capturado para a transmissão, não o volume do seu headset. Acima de 100% pode distorcer se o jogo já estiver alto.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
+        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O modo Budget fixa 720p30, 2 Mbps, sem filtro e encoder rápido; em tela inteira, capture o áudio somente do app selecionado.</div><div class="hint">O ganho afeta somente o áudio capturado para a transmissão, não o volume do seu headset. Acima de 100% pode distorcer se o jogo já estiver alto.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
     </section>
     <nav class="tabs"><button class="tab active" data-tab="windows">Janelas abertas</button><button class="tab" data-tab="screen">Tela inteira</button></nav>
@@ -262,12 +277,29 @@ HTML = r"""<!doctype html>
       if (settings.encoder) $('encoder').value = settings.encoder;
       if (settings.scale_filter) $('scaleFilter').value = settings.scale_filter;
       $('webrtcProfile').value = settings.webrtc_x264_profile ? 'x264' : 'off';
+      $('performanceMode').value = settings.performance_mode || 'normal';
       syncWebrtcProfile();
+      syncPerformanceMode();
     }
     function syncWebrtcProfile() {
       const enabled = $('webrtcProfile').value === 'x264';
       if (enabled && [...$('encoder').options].some(option => option.value === 'x264')) $('encoder').value = 'x264';
       $('encoder').disabled = enabled;
+    }
+    function syncPerformanceMode() {
+      const budget = $('performanceMode').value === 'budget';
+      if (budget) {
+        $('videoBitrate').value = '2';
+        $('audioBitrate').value = '128';
+        $('fps').value = '30';
+        $('resolution').value = '1280x720';
+        $('scaleFilter').value = 'none';
+        $('webrtcProfile').value = 'off';
+        const preferred = ['nvenc_h264', 'qsv_h264', 'x264'].find(id => [...$('encoder').options].some(option => option.value === id));
+        if (preferred) $('encoder').value = preferred;
+      }
+      ['videoBitrate', 'audioBitrate', 'fps', 'resolution', 'encoder', 'scaleFilter', 'webrtcProfile'].forEach(id => $(id).disabled = budget);
+      $('audioBoost').disabled = false;
     }
     function readSettingsFields() {
       const [output_width, output_height] = $('resolution').value.split('x').map(Number);
@@ -281,13 +313,14 @@ HTML = r"""<!doctype html>
         encoder: $('encoder').value,
         scale_filter: $('scaleFilter').value,
         webrtc_x264_profile: $('webrtcProfile').value === 'x264',
+        performance_mode: $('performanceMode').value,
       };
     }
     function refreshSettingsDirty() {
       const current = readSettingsFields();
       const saved = state.settings || {};
       const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.audio_boost !== Number(saved.audio_boost || 100) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile);
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.audio_boost !== Number(saved.audio_boost || 100) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile) || current.performance_mode !== (saved.performance_mode || 'normal');
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -330,6 +363,7 @@ HTML = r"""<!doctype html>
         encoder: $('encoder').value,
         scale_filter: $('scaleFilter').value,
         webrtc_x264_profile: $('webrtcProfile').value === 'x264',
+        performance_mode: $('performanceMode').value,
       }, true);
     }
     async function share(path, payload, syncSettings = false) { setStatus(path === '/api/settings' ? 'Salvando ajustes no OBS...' : 'Preparando o OBS...', ''); try { const response = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Falha desconhecida'); state = data; if (syncSettings) { settingsDirty = false; $('settingsDirty').hidden = true; } render(syncSettings); setStatus(data.message || 'Transmissão atualizada.', 'ok'); } catch (e) { setStatus(e.message, 'error'); } }
@@ -345,6 +379,7 @@ HTML = r"""<!doctype html>
     $('encoder').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
     $('scaleFilter').addEventListener('change', refreshSettingsDirty);
     $('webrtcProfile').addEventListener('change', () => { syncWebrtcProfile(); refreshSettingsDirty(); });
+    $('performanceMode').addEventListener('change', () => { syncPerformanceMode(); refreshSettingsDirty(); });
     $('search').addEventListener('input', render);
     document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { activeTab = tab.dataset.tab; document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab)); $('windowsPanel').hidden = activeTab !== 'windows'; $('screenPanel').hidden = activeTab !== 'screen'; if (activeTab === 'screen') render(); }));
     load();
@@ -574,6 +609,14 @@ class PanelApp:
                 available.append({"id": encoder_id, "label": option["label"]})
         return available
 
+    @classmethod
+    def budget_encoder(cls):
+        available = {item["id"] for item in cls.available_encoders()}
+        for encoder_id in ("nvenc_h264", "qsv_h264", "x264"):
+            if encoder_id in available:
+                return encoder_id
+        return DEFAULT_SETTINGS["encoder"]
+
     def load_settings_file(self):
         candidates = [SETTINGS_FILE]
         if LEGACY_SETTINGS_FILE != SETTINGS_FILE:
@@ -685,6 +728,8 @@ class PanelApp:
     @staticmethod
     def nvenc_preset_for_settings(settings):
         if settings["encoder"] in {"nvenc_h264", "nvenc_hevc", "nvenc_av1"}:
+            if settings.get("performance_mode", DEFAULT_SETTINGS["performance_mode"]) == "budget":
+                return "p1"
             return "p4" if settings["output_width"] <= 1280 and settings["output_height"] <= 720 else "p5"
         return None
 
@@ -963,7 +1008,13 @@ class PanelApp:
             "encoder": payload.get("encoder", DEFAULT_SETTINGS["encoder"]),
             "scale_filter": payload.get("scale_filter", DEFAULT_SETTINGS["scale_filter"]),
             "webrtc_x264_profile": payload.get("webrtc_x264_profile", DEFAULT_SETTINGS["webrtc_x264_profile"]),
+            "performance_mode": payload.get("performance_mode", DEFAULT_SETTINGS["performance_mode"]),
         }
+        if settings["performance_mode"] not in PERFORMANCE_MODE_OPTIONS:
+            raise ValueError("Perfil de desempenho inválido.")
+        if settings["performance_mode"] == "budget":
+            settings.update(BUDGET_SETTINGS)
+            settings["encoder"] = PanelApp.budget_encoder()
         if settings["encoder"] not in ENCODER_OPTIONS:
             raise ValueError("Encoder inválido.")
         if settings["encoder"] not in {item["id"] for item in PanelApp.available_encoders()}:
@@ -1007,7 +1058,8 @@ class PanelApp:
                 f"{settings['output_width']}×{settings['output_height']}, "
                 f"ganho de áudio {settings['audio_boost']}%, "
                 f"{ENCODER_OPTIONS[settings['encoder']]['label']}, "
-                f"{SCALE_FILTER_OPTIONS[settings['scale_filter']]}. "
+                f"{SCALE_FILTER_OPTIONS[settings['scale_filter']]}, "
+                f"perfil {PERFORMANCE_MODE_OPTIONS[settings['performance_mode']]}. "
                 f"Arquivo: {self.settings_file}."
             )
             if settings.get("webrtc_x264_profile", False):
@@ -1037,7 +1089,8 @@ class PanelApp:
             obs.call("SetCurrentProgramScene", {"sceneName": PICKER.SCENE})
             PICKER.set_enabled(obs, PICKER.OLD_GAME_SOURCE, False)
             PICKER.remove_picker_audio_inputs(obs)
-            input_kind, input_settings = PICKER.capture_settings_for_window(window)
+            budget_mode = self.saved_settings.get("performance_mode") == "budget"
+            input_kind, input_settings = PICKER.capture_settings_for_window(window, budget_mode)
             item = PICKER.ensure_input(obs, PICKER.PICKER_VIDEO, input_kind, input_settings)
             PICKER.set_input_volume(obs, PICKER.PICKER_VIDEO, self.saved_settings["audio_boost"] / 100)
             PICKER.set_enabled(obs, PICKER.PICKER_VIDEO, True)
@@ -1076,10 +1129,18 @@ class PanelApp:
             audio_note = "sem áudio"
             if audio:
                 preferred = self.find_window(hwnd) if hwnd else None
+                budget_mode = self.saved_settings.get("performance_mode") == "budget"
                 audio_sources = PICKER.configure_audio_without_discord(
-                    obs, preferred, self.saved_settings["audio_boost"] / 100
+                    obs,
+                    preferred,
+                    self.saved_settings["audio_boost"] / 100,
+                    only_preferred=budget_mode,
                 )
-                audio_note = f"áudio de apps, exceto Discord ({len(audio_sources)} fontes)"
+                audio_note = (
+                    f"áudio do app selecionado ({len(audio_sources)} fonte)"
+                    if budget_mode
+                    else f"áudio de apps, exceto Discord ({len(audio_sources)} fontes)"
+                )
             else:
                 PICKER.remove_picker_audio_inputs(obs)
             PICKER.start_if_needed(obs)
