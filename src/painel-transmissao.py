@@ -81,16 +81,16 @@ PERFORMANCE_MODE_OPTIONS = {
     "budget": "Budget (720p30 · leve)",
 }
 DEFAULT_SETTINGS = {
-    "video_bitrate": 6000,
-    "audio_bitrate": 160,
-    "audio_boost": 100,
-    "fps": 60,
-    "output_width": 1920,
-    "output_height": 1080,
+    "video_bitrate": 2000,
+    "audio_bitrate": 192,
+    "audio_boost": 200,
+    "fps": 30,
+    "output_width": 1280,
+    "output_height": 720,
     "encoder": "nvenc_h264",
-    "scale_filter": "auto",
+    "scale_filter": "none",
     "webrtc_x264_profile": False,
-    "performance_mode": "normal",
+    "performance_mode": "budget",
 }
 X264_WEBRTC_SETTINGS = {
     "RateControl": "CRF",
@@ -104,7 +104,7 @@ X264_WEBRTC_SETTINGS = {
 }
 BUDGET_SETTINGS = {
     "video_bitrate": 2000,
-    "audio_bitrate": 128,
+    "audio_bitrate": 192,
     "fps": 30,
     "output_width": 1280,
     "output_height": 720,
@@ -241,7 +241,7 @@ HTML = r"""<!doctype html>
           <label class="field">Perfil WebRTC <small>x264 opcional</small><select id="webrtcProfile"><option value="off">Desligado (configuração normal)</option><option value="x264">x264 · CRF 23 · 1s · Veryfast</option></select></label>
           <label class="field">Desempenho <small>perfil</small><select id="performanceMode"><option value="normal">Normal (ajustes manuais)</option><option value="budget">Budget (720p30 · leve)</option></select></label>
         </div>
-        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O modo Budget fixa 720p30, 2 Mbps, sem filtro e encoder rápido; em tela inteira, capture o áudio somente do app selecionado.</div><div class="hint">O ganho afeta somente o áudio capturado para a transmissão, não o volume do seu headset. Acima de 100% pode distorcer se o jogo já estiver alto.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
+        <div class="settings-footer"><div><div class="hint">Salvar configura a qualidade independentemente da janela/tela escolhida.</div><div class="hint">O modo Budget fixa 720p30, 2 Mbps de vídeo, 192 kbps de áudio Opus, sem filtro e encoder rápido; em tela inteira, capture o áudio somente do app selecionado.</div><div class="hint">O ganho afeta somente o áudio capturado para a transmissão, não o volume do seu headset. Acima de 100% pode distorcer se o jogo já estiver alto.</div><div class="hint">O perfil WebRTC usa x264 Advanced: CRF 23, keyframe de 1s, veryfast, High, fastdecode e bframes=0. Ele desativa o bitrate CBR.</div><div class="hint" id="settingsFileHint">As configurações serão salvas localmente.</div><div class="settings-dirty" id="settingsDirty" hidden>Há alterações ainda não salvas.</div></div><button class="button primary" id="saveSettings" type="button">Salvar ajustes</button></div>
       </div>
     </section>
     <nav class="tabs"><button class="tab active" data-tab="windows">Janelas abertas</button><button class="tab" data-tab="screen">Tela inteira</button></nav>
@@ -277,7 +277,7 @@ HTML = r"""<!doctype html>
       if (settings.encoder) $('encoder').value = settings.encoder;
       if (settings.scale_filter) $('scaleFilter').value = settings.scale_filter;
       $('webrtcProfile').value = settings.webrtc_x264_profile ? 'x264' : 'off';
-      $('performanceMode').value = settings.performance_mode || 'normal';
+      $('performanceMode').value = settings.performance_mode || 'budget';
       syncWebrtcProfile();
       syncPerformanceMode();
     }
@@ -290,7 +290,7 @@ HTML = r"""<!doctype html>
       const budget = $('performanceMode').value === 'budget';
       if (budget) {
         $('videoBitrate').value = '2';
-        $('audioBitrate').value = '128';
+        $('audioBitrate').value = '192';
         $('fps').value = '30';
         $('resolution').value = '1280x720';
         $('scaleFilter').value = 'none';
@@ -320,7 +320,7 @@ HTML = r"""<!doctype html>
       const current = readSettingsFields();
       const saved = state.settings || {};
       const numericFields = ['video_bitrate', 'audio_bitrate', 'fps', 'output_width', 'output_height'];
-      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.audio_boost !== Number(saved.audio_boost || 100) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile) || current.performance_mode !== (saved.performance_mode || 'normal');
+      settingsDirty = numericFields.some(name => !Number.isFinite(current[name]) || Number(saved[name]) !== current[name]) || current.audio_boost !== Number(saved.audio_boost || 200) || current.encoder !== saved.encoder || current.scale_filter !== saved.scale_filter || current.webrtc_x264_profile !== Boolean(saved.webrtc_x264_profile) || current.performance_mode !== (saved.performance_mode || 'budget');
       $('settingsDirty').hidden = !settingsDirty;
     }
     function render(syncSettings = false) {
@@ -634,7 +634,19 @@ class PanelApp:
 
     @staticmethod
     def settings_match(left, right):
-        return all(left.get(name) == right.get(name) for name in DEFAULT_SETTINGS)
+        return all(
+            left.get(name) == right.get(name)
+            for name in DEFAULT_SETTINGS
+            if name != "performance_mode"
+        )
+
+    @classmethod
+    def default_settings(cls):
+        settings = dict(DEFAULT_SETTINGS)
+        if settings["performance_mode"] == "budget":
+            settings.update(BUDGET_SETTINGS)
+            settings["encoder"] = cls.budget_encoder()
+        return settings
 
     def persist_settings(self, settings):
         content = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
@@ -661,9 +673,9 @@ class PanelApp:
             active = bool(obs.call("GetStreamStatus").get("outputActive"))
         except Exception:
             pass
-        settings = dict(self.saved_settings or DEFAULT_SETTINGS)
+        settings = dict(self.saved_settings or self.default_settings())
         if obs is not None and self.saved_settings is None:
-            settings = self.current_settings(obs)
+            settings = self.default_settings()
             self.saved_settings = settings
             self.persist_settings(settings)
         return {
@@ -882,7 +894,7 @@ class PanelApp:
 
     def ensure_saved_settings(self, obs):
         if self.saved_settings is None:
-            self.saved_settings = self.current_settings(obs)
+            self.saved_settings = self.default_settings()
             self.persist_settings(self.saved_settings)
             self.apply_settings_to_obs(obs, self.saved_settings)
             PICKER.apply_picker_audio_volume(obs, self.saved_settings["audio_boost"] / 100)
