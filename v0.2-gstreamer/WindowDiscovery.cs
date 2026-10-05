@@ -60,6 +60,33 @@ public static class WindowDiscovery
             .ToArray();
     }
 
+    /// <summary>
+    /// Physical pixel size of what will be captured: the window's client area
+    /// or the monitor's current mode. Read with per-monitor DPI awareness so a
+    /// 150% scaled 4K screen reports 3840x2160 rather than 2560x1440.
+    /// </summary>
+    public static (int Width, int Height) GetSourceSize(WindowTarget target)
+    {
+        var previous = SetThreadDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2);
+        try
+        {
+            if (target.SourceKind == VideoSourceKind.Monitor)
+            {
+                var screens = Screen.AllScreens;
+                if (target.MonitorIndex < 0 || target.MonitorIndex >= screens.Length) return (0, 0);
+                var mode = new DevMode { dmSize = (short)Marshal.SizeOf<DevMode>() };
+                return EnumDisplaySettings(screens[target.MonitorIndex].DeviceName, EnumCurrentSettings, ref mode)
+                    ? (mode.dmPelsWidth, mode.dmPelsHeight)
+                    : (screens[target.MonitorIndex].Bounds.Width, screens[target.MonitorIndex].Bounds.Height);
+            }
+            return GetClientRect(target.Hwnd, out var rect) ? (rect.Right - rect.Left, rect.Bottom - rect.Top) : (0, 0);
+        }
+        finally
+        {
+            if (previous != 0) SetThreadDpiAwarenessContext(previous);
+        }
+    }
+
     public static bool IsAlive(WindowTarget target) =>
         target.SourceKind == VideoSourceKind.Monitor
             ? target.MonitorIndex >= 0 && target.MonitorIndex < Screen.AllScreens.Length
@@ -118,6 +145,34 @@ public static class WindowDiscovery
     }
 
     private delegate bool EnumWindowsProc(nint hwnd, nint lParam);
+
+    private const int EnumCurrentSettings = -1;
+    private static readonly nint DpiAwarenessContextPerMonitorAwareV2 = -4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DevMode
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetClientRect(nint hwnd, out Rect rect);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplaySettings(string deviceName, int modeNumber, ref DevMode mode);
+
+    [DllImport("user32.dll")]
+    private static extern nint SetThreadDpiAwarenessContext(nint context);
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc callback, nint lParam);

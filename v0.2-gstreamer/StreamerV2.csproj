@@ -8,6 +8,9 @@
     <Nullable>enable</Nullable>
     <NoWarn>$(NoWarn);MSB3277</NoWarn>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- No culture-sensitive formatting is shown; skip loading ICU at startup. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TieredPGO>true</TieredPGO>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="GstSharpBundle" Version="1.24.3-preview6" />

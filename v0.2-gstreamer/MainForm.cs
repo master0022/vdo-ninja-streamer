@@ -9,6 +9,8 @@ internal sealed class MainForm : Form
 {
     private readonly AtomicSettingsStore _settingsStore = new(Path.Combine(AppContext.BaseDirectory, "settings-v02.json"));
     private readonly GStreamerEngine _engine = new();
+    private readonly Task _gstreamerReady;
+    private IReadOnlyList<EncoderOption>? _encoderOptions;
     private readonly WebView2 _webView = new();
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web);
     private IReadOnlyList<WindowTarget> _windows = Array.Empty<WindowTarget>();
@@ -20,17 +22,27 @@ internal sealed class MainForm : Form
     private nint _selectedHwnd;
     private int _selectedMonitorIndex = -1;
     private bool _closing;
+    // True once the running session reported its first live parameters.
+    private bool _live;
 
-    public MainForm()
+    public MainForm(Task gstreamerReady)
     {
+        _gstreamerReady = gstreamerReady;
         Text = "Streamer v0.2";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(980, 720);
-        ClientSize = new Size(1180, 860);
+        // Sizes are in 96-DPI units; scale them so a 150% display does not
+        // squeeze the page into its narrow (phone) layout, and keep the
+        // window inside the work area on small screens.
+        var scale = DeviceDpi / 96f;
+        var workArea = Screen.FromPoint(Cursor.Position).WorkingArea;
+        MinimumSize = new Size((int)(480 * scale), (int)(520 * scale));
+        ClientSize = new Size(
+            Math.Min((int)(660 * scale), workArea.Width * 9 / 10),
+            Math.Min((int)(780 * scale), workArea.Height * 9 / 10));
         Icon = LoadApplicationIcon();
         BackColor = Color.FromArgb(12, 15, 22);
 
-        _settings = _settingsStore.LoadOrDefault(Presets.StableOldPc);
+        _settings = Presets.Migrate(_settingsStore.LoadOrDefault(Presets.StableOldPc));
         _webView.Dock = DockStyle.Fill;
         _webView.DefaultBackgroundColor = BackColor;
         Controls.Add(_webView);
@@ -51,9 +63,18 @@ internal sealed class MainForm : Form
             if (!File.Exists(browserExecutable))
                 throw new InvalidOperationException("The bundled WebView2 runtime is missing from the WebView2 folder next to StreamerV2.exe.");
 
+            // The UI is one static local page: no GPU process (keeps VRAM and
+            // the D3D device free for capture/NVENC), one renderer, and none of
+            // Edge's background services, updaters or SmartScreen lookups.
+            var options = new CoreWebView2EnvironmentOptions(
+                "--disable-gpu --disable-gpu-compositing --renderer-process-limit=1 " +
+                "--disable-background-networking --disable-component-update --disable-sync " +
+                "--disable-extensions --no-first-run --disable-default-apps " +
+                "--disable-features=msSmartScreenProtection,msEdgeEnableNurturingFramework,Translate,OptimizationHints,AutofillServerCommunication,SpareRendererForSitePerProcess");
             var environment = await CoreWebView2Environment.CreateAsync(
                 browserExecutableFolder: fixedRuntime,
-                userDataFolder: userData);
+                userDataFolder: userData,
+                options: options);
             await _webView.EnsureCoreWebView2Async(environment);
             _core = _webView.CoreWebView2;
             _core.Settings.AreDefaultContextMenusEnabled = false;
@@ -72,7 +93,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
         try
         {
@@ -85,21 +106,30 @@ internal sealed class MainForm : Form
                     RefreshWindows();
                     SendState();
                     Log($"Loaded portable settings from {_settingsStore.PathForDisplay}.");
+                    if (!_gstreamerReady.IsCompleted)
+                    {
+                        SetStatus("LOADING ENGINE", "starting");
+                        await _gstreamerReady;
+                        SetStatus("IDLE", "idle");
+                        SendState();
+                    }
                     break;
                 case "refresh":
                     RefreshWindows();
                     SendState();
                     break;
                 case "save":
-                    SaveFromUi(root.GetProperty("settings"));
+                    SaveFromUi(root.GetProperty("settings"), root.TryGetProperty("quiet", out var quiet) && quiet.GetBoolean());
                     break;
                 case "save-key":
                     SaveStreamKey(root);
                     break;
                 case "start":
+                    await _gstreamerReady;
                     StartStream(root);
                     break;
                 case "capture":
+                    await _gstreamerReady;
                     StartCapture(root);
                     break;
                 case "stop":
@@ -135,12 +165,13 @@ internal sealed class MainForm : Form
         Log($"Found {_windows.Count} visible application windows and {_monitors.Count} monitors.");
     }
 
-    private void SaveFromUi(JsonElement uiSettings)
+    private void SaveFromUi(JsonElement uiSettings, bool quiet)
     {
         try
         {
             _settings = ReadSettings(uiSettings, requireToken: false);
             _settingsStore.Save(_settings);
+            if (quiet) return;
             SetStatus("SAVED", "success");
             Log("Configuration saved locally.");
             SendState();
@@ -158,7 +189,7 @@ internal sealed class MainForm : Form
         {
             var token = String(root, "streamKey", _settings.BearerToken).Trim();
             if (token.Length == 0) throw new InvalidOperationException("Stream key cannot be empty.");
-            _settings = _settings with { BearerToken = token, SettingsVersion = 2 };
+            _settings = _settings with { BearerToken = token };
             _settingsStore.Save(_settings);
             SetStatus("KEY SAVED", "success");
             Log("Stream key saved locally.");
@@ -201,7 +232,10 @@ internal sealed class MainForm : Form
         _selectedHwnd = target.Hwnd;
         _selectedMonitorIndex = target.MonitorIndex;
         _runCancellation = new CancellationTokenSource();
-        _runTask = Task.Run(() => _engine.RunWindowStream(target, _settings, TimeSpan.FromDays(7), _runCancellation.Token));
+        var settingsForRun = _settings;
+        var observer = UiObserver("LIVE");
+        _live = false;
+        _runTask = Task.Run(() => _engine.RunWindowStream(target, settingsForRun, TimeSpan.FromDays(7), _runCancellation.Token, observer));
         SetStatus("STARTING", "starting");
         Log($"Starting {TargetDescription(target)}.");
         _ = ObserveRunAsync(_runTask, "stream");
@@ -240,7 +274,10 @@ internal sealed class MainForm : Form
         _selectedHwnd = target.Hwnd;
         _selectedMonitorIndex = target.MonitorIndex;
         _runCancellation = new CancellationTokenSource();
-        _runTask = Task.Run(() => _engine.RunWindowCaptureTest(target, _settings, TimeSpan.FromSeconds(10), output, _runCancellation.Token));
+        var settingsForRun = _settings;
+        var observer = UiObserver("CAPTURING");
+        _live = false;
+        _runTask = Task.Run(() => _engine.RunWindowCaptureTest(target, settingsForRun, TimeSpan.FromSeconds(10), output, _runCancellation.Token, observer));
         SetStatus("CAPTURING", "starting");
         Log($"Running a 10-second local capture test. Output: {output}");
         _ = ObserveRunAsync(_runTask, "capture");
@@ -355,7 +392,11 @@ internal sealed class MainForm : Form
             videoSource,
             Clamp(value, "monitorIndex", _settings.MonitorIndex, -1, 32),
             audioSource,
-            2);
+            Presets.CurrentSettingsVersion,
+            EnumValue(value, "mode", _settings.Mode),
+            value.TryGetProperty("autoQuality", out var auto) && auto.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? auto.GetBoolean()
+                : _settings.AutoQuality);
     }
 
     private void SendState()
@@ -365,8 +406,8 @@ internal sealed class MainForm : Form
         {
             type = "state",
             running = _runTask is { IsCompleted: false },
-            status = _runTask is { IsCompleted: false } ? "LIVE" : "IDLE",
-            encoders = GStreamerEngine.GetEncoderOptions().Select(o => new
+            status = _runTask is { IsCompleted: false } ? (_live ? "LIVE" : "STARTING") : "IDLE",
+            encoders = EncoderOptions().Select(o => new
             {
                 value = o.Value.ToString(),
                 label = o.Label,
@@ -396,10 +437,38 @@ internal sealed class MainForm : Form
                 crf = _settings.Crf,
                 videoSource = _settings.VideoSource.ToString(),
                 monitorIndex = _settings.MonitorIndex,
-                audioSource = _settings.AudioSource.ToString()
+                audioSource = _settings.AudioSource.ToString(),
+                mode = _settings.Mode.ToString(),
+                autoQuality = _settings.AutoQuality
             }
         };
         _core.PostWebMessageAsJson(JsonSerializer.Serialize(state, _json));
+    }
+
+    // Plugin availability cannot change while the process runs, so look the
+    // factories up once instead of on every state push.
+    private IReadOnlyList<EncoderOption> EncoderOptions()
+    {
+        if (_encoderOptions is not null) return _encoderOptions;
+        if (!_gstreamerReady.IsCompletedSuccessfully) return Array.Empty<EncoderOption>();
+        return _encoderOptions = GStreamerEngine.GetEncoderOptions();
+    }
+
+    /// <summary>Engine callbacks arrive on the stream thread; WebView2 needs the UI thread.</summary>
+    private StreamObserver UiObserver(string liveStatus) => new(
+        info => OnUi(() =>
+        {
+            _live = true;
+            SetStatus(liveStatus, "live");
+            Send(new { type = "live", info.Encoder, info.Width, info.Height, info.FramesPerSecond, info.BitrateKbps, info.Adjustment });
+        }),
+        text => OnUi(() => Log(text)));
+
+    private void OnUi(Action action)
+    {
+        if (_closing || IsDisposed) return;
+        try { BeginInvoke(action); }
+        catch (InvalidOperationException) { /* window is closing */ }
     }
 
     private void SetStatus(string text, string tone) => Send(new { type = "status", text, tone });

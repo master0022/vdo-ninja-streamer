@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using System.Globalization;
+using System.Runtime.InteropServices;
 using Gst;
 using GstSharpBundle;
 
@@ -21,553 +21,624 @@ public sealed record RuntimeMetrics(
     long ProcessCpuTimeMilliseconds,
     int Samples);
 
+/// <summary>Callbacks a run reports through; both may be raised from a worker thread.</summary>
+public sealed record StreamObserver(Action<LiveStreamInfo>? OnInfo = null, Action<string>? OnLog = null, Action<string>? OnTrace = null)
+{
+    public static readonly StreamObserver Console = new(
+        info => System.Console.WriteLine($"[live] {info.Encoder} {info.Width}x{info.Height}@{info.FramesPerSecond} {info.BitrateKbps} kbps {info.Adjustment}"),
+        text => System.Console.WriteLine("[log] " + text),
+        text => System.Console.WriteLine("[trace] " + text));
+}
+
 public sealed class GStreamerEngine : IDisposable
 {
-    private sealed record VideoCodecInfo(
-        string Name,
-        string EncoderFactory,
-        string ParserFactory,
-        string PayloaderFactory,
-        uint PayloadType,
-        bool RequiresSystemMemory,
-        bool IsHardware);
+    private const string WindowGoneError = "The captured window or monitor was closed, removed or minimized; the stream stopped for safety.";
+    // A session that never produced an encoded frame within this time is
+    // treated as an encoder that cannot run on this PC.
+    private static readonly TimeSpan EncoderStartTimeout = TimeSpan.FromSeconds(8);
+    private const int MaxConsecutiveReconnects = 8;
 
     private Pipeline? _pipeline;
     private bool _disposed;
 
     public static void Initialize()
     {
-        // Do not let two portable copies race on GStreamer's shared registry
-        // cache. A private per-process registry also avoids stale plugin
-        // metadata after the ZIP is moved to another machine.
-        var registryDirectory = Path.Combine(Path.GetTempPath(), "StreamerV2", "gstreamer-registry");
+        // A registry that survives restarts turns the multi-second plugin scan
+        // into a ~30 ms cache load. It is keyed by install folder so separate
+        // portable copies never share one; GStreamer itself rescans any plugin
+        // whose size/mtime changed and writes the cache via temp file + rename.
+        var registryDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "StreamerV2", "gstreamer-registry");
         Directory.CreateDirectory(registryDirectory);
+        var installKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(AppContext.BaseDirectory.ToUpperInvariant())))[..16];
         Environment.SetEnvironmentVariable(
             "GST_REGISTRY",
-            Path.Combine(registryDirectory, $"registry-{Environment.ProcessId}.bin"));
+            Path.Combine(registryDirectory, $"registry-{installKey}.bin"));
+        DeleteLegacyPerProcessRegistries();
         GStreamerBundle.Initialize();
         Gst.Application.Init();
     }
 
+    private static void DeleteLegacyPerProcessRegistries()
+    {
+        // Older builds left one ~2 MB registry per launch in %TEMP%.
+        try
+        {
+            var legacy = Path.Combine(Path.GetTempPath(), "StreamerV2", "gstreamer-registry");
+            if (Directory.Exists(legacy)) Directory.Delete(legacy, recursive: true);
+        }
+        catch
+        {
+            // Another old copy may still hold its file open; try again next launch.
+        }
+    }
+
     public static IReadOnlyList<EncoderOption> GetEncoderOptions()
     {
-        var av1Factory = FindAv1EncoderFactory();
-        return new List<EncoderOption>
+        var automatic = EncoderCatalog.Candidates(EncoderKind.Auto);
+        var options = new List<EncoderOption>
         {
-            EncoderOptionFor(EncoderKind.H264Nvenc, "H.264 NVENC", "nvd3d11h264enc"),
-            EncoderOptionFor(EncoderKind.HevcNvenc, "H.265 / HEVC NVENC", "nvd3d11h265enc"),
-            new EncoderOption(
-                EncoderKind.Av1Nvenc,
-                "AV1 NVENC",
-                av1Factory is not null,
-                av1Factory is null
-                    ? "Not included in this bundled GStreamer runtime (hardware AV1 stays disabled)."
-                    : $"Available through {av1Factory}."),
-            EncoderOptionFor(EncoderKind.H264X264, "H.264 x264 (CPU)", "x264enc")
+            new(EncoderKind.Auto, "Automatic (recommended)", automatic.Count > 0,
+                automatic.Count > 0
+                    ? "Tries " + string.Join(" → ", automatic.Select(e => e.Label)) + ", keeping the first that works."
+                    : "No H.264 encoder is available in this runtime.")
         };
+        foreach (var entry in EncoderCatalog.All)
+        {
+            var factory = EncoderCatalog.FindFactory(entry);
+            options.Add(new EncoderOption(entry.Kind, entry.Label, factory is not null,
+                factory is not null
+                    ? $"Available through {factory}."
+                    : entry.IsHardware ? "Not supported by this PC's GPU or driver." : $"Missing GStreamer plugin: {entry.Factories[0]}."));
+        }
+        return options;
     }
 
-    private static EncoderOption EncoderOptionFor(EncoderKind value, string label, string factory)
-    {
-        var available = HasFactory(factory);
-        return new EncoderOption(
-            value,
-            label,
-            available,
-            available ? $"Available through {factory}." : $"Missing GStreamer plugin: {factory}.");
-    }
-
-    private static bool HasFactory(string factory) => ElementFactory.Find(factory) is not null;
-
-    private static string? FindAv1EncoderFactory() =>
-        new[] { "nvd3d11av1enc", "nvautogpuav1enc", "nvav1enc" }.FirstOrDefault(HasFactory);
-
-    public StreamRunResult RunWindowStream(WindowTarget target, StreamSettings settings, TimeSpan duration, CancellationToken cancellationToken)
+    public StreamRunResult RunWindowStream(WindowTarget target, StreamSettings settings, TimeSpan duration, CancellationToken cancellationToken, StreamObserver? observer = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!WindowDiscovery.IsAlive(target))
-            return new(false, false, TimeSpan.Zero, "A janela alvo não está viva.", 0, "");
+            return new(false, false, TimeSpan.Zero, "The target window is not available.", 0, "");
         if (string.IsNullOrWhiteSpace(settings.WhipEndpoint))
-            return new(false, false, TimeSpan.Zero, "WHIP endpoint vazio.", 0, "");
+            return new(false, false, TimeSpan.Zero, "WHIP endpoint is empty.", 0, "");
         if (string.IsNullOrWhiteSpace(settings.BearerToken))
-            return new(false, false, TimeSpan.Zero, "Bearer token/stream key vazio.", 0, "");
-
-        try
-        {
-            var description = PipelineTextBuilder.BuildWindowWhip(target, settings);
-            return RunPipeline(target, description, duration, cancellationToken, BuildWhipPipeline);
-        }
-        catch (Exception ex)
-        {
-            return new(false, false, TimeSpan.Zero, ex.GetBaseException().Message, 0, "");
-        }
+            return new(false, false, TimeSpan.Zero, "Stream key is empty.", 0, "");
+        return Run(target, settings, outputPath: null, duration, cancellationToken, observer ?? new StreamObserver());
     }
 
-    public StreamRunResult RunWindowCaptureTest(WindowTarget target, StreamSettings settings, TimeSpan duration, string outputPath, CancellationToken cancellationToken)
+    public StreamRunResult RunWindowCaptureTest(WindowTarget target, StreamSettings settings, TimeSpan duration, string outputPath, CancellationToken cancellationToken, StreamObserver? observer = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!WindowDiscovery.IsAlive(target))
-            return new(false, false, TimeSpan.Zero, "A janela alvo não está viva.", 0, "");
-
-        try
-        {
-            var description = PipelineTextBuilder.BuildLocalCapture(target, settings, outputPath);
-            return RunPipeline(target, description, duration, cancellationToken, BuildCapturePipeline);
-        }
-        catch (Exception ex)
-        {
-            return new(false, false, TimeSpan.Zero, ex.GetBaseException().Message, 0, "");
-        }
+            return new(false, false, TimeSpan.Zero, "The target window is not available.", 0, "");
+        return Run(target, settings, Path.GetFullPath(outputPath), duration, cancellationToken, observer ?? new StreamObserver());
     }
 
-    private StreamRunResult RunPipeline(WindowTarget target, string description, TimeSpan duration, CancellationToken cancellationToken, Func<Pipeline> buildPipeline)
+    /// <summary>
+    /// Runs sessions until the duration ends or the user stops: falls through
+    /// the encoder candidates while none has produced a frame yet, and
+    /// reconnects with backoff when an established stream drops.
+    /// </summary>
+    private StreamRunResult Run(WindowTarget target, StreamSettings settings, string? outputPath, TimeSpan duration, CancellationToken cancellationToken, StreamObserver observer)
     {
         var stopwatch = Stopwatch.StartNew();
+        var deadline = System.DateTime.UtcNow + duration;
+        var metrics = new MetricsRecorder();
+        var candidates = EncoderCatalog.Candidates(settings.Encoder);
+        if (candidates.Count == 0)
+            return new(false, false, TimeSpan.Zero, "No usable H.264 encoder was found on this PC.", 0, "");
+
+        var (sourceWidth, sourceHeight) = WindowDiscovery.GetSourceSize(target);
+        var levels = settings.AutoQuality
+            ? AdaptiveController.BuildLadder(settings.Mode, sourceWidth, sourceHeight)
+            : [new QualityLevel(settings.Width, settings.Height, settings.FramesPerSecond, settings.VideoBitrateKbps)];
+
         long busMessages = 0;
-        string? error = null;
-        var started = false;
-        var process = Process.GetCurrentProcess();
-        var metricSamples = new List<(double Cpu, long WorkingSet)>();
-        var lastMetricWall = Stopwatch.GetTimestamp();
-        var lastMetricCpu = process.TotalProcessorTime;
+        string? lastError = null;
+        string description = "";
+        var everStarted = false;
+        var candidateIndex = 0;
+        var reconnects = 0;
+        var retriedBelow4K = false;
+        AdaptiveController? controller = null;
 
-        try
+        while (!cancellationToken.IsCancellationRequested && System.DateTime.UtcNow < deadline && candidateIndex < candidates.Count)
         {
-            // GstSharp's Parse.Launch binding currently causes an ABI-level access violation
-            // on this Windows bundle. Building elements individually also makes ownership explicit.
-            _pipeline = buildPipeline();
-            var state = _pipeline.SetState(State.Playing);
-            if (state == StateChangeReturn.Failure)
-                throw new InvalidOperationException("GStreamer recusou o estado PLAYING.");
-            started = true;
-
-            var bus = _pipeline.Bus ?? throw new InvalidOperationException("Pipeline sem bus.");
-            var deadline = System.DateTime.UtcNow + duration;
-            while (System.DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+            var entry = candidates[candidateIndex];
+            var factory = EncoderCatalog.FindFactory(entry);
+            if (factory is null)
             {
-                SampleProcessMetrics(process, metricSamples, ref lastMetricWall, ref lastMetricCpu);
-                if (!WindowDiscovery.IsAlive(target))
-                {
-                    error = "A janela ou monitor capturado foi fechado, removido ou minimizado; stream encerrado por segurança.";
-                    break;
-                }
+                lastError = $"{entry.Label} is not available on this PC.";
+                candidateIndex++;
+                continue;
+            }
 
-                var message = bus.TimedPopFiltered(100_000_000, MessageType.Error | MessageType.Eos | MessageType.Warning | MessageType.Qos);
-                if (message is null)
+            // A new encoder starts from its own safe level; a reconnect keeps
+            // whatever the controller had learned about this PC and network.
+            controller ??= new AdaptiveController(levels, AdaptiveController.StartIndex(levels, entry.IsHardware), settings.AutoQuality);
+
+            var session = new Session(target, settings, entry, factory, outputPath, controller, observer);
+            description = session.Description;
+            observer.OnLog?.Invoke($"Starting {entry.Label} at {controller.Current.Width}x{controller.Current.Height}@{controller.Current.FramesPerSecond}, {controller.BitrateKbps} kbps.");
+            var outcome = session.Run(this, deadline, cancellationToken, metrics);
+            busMessages += outcome.BusMessages;
+            everStarted |= outcome.ProducedFrames;
+            lastError = outcome.Error;
+
+            if (outcome.Error is null || outcome.WindowGone || cancellationToken.IsCancellationRequested)
+                break;
+
+            if (!outcome.ProducedFrames)
+            {
+                // Older GPUs cap encoder resolution; retry once at 1080p before
+                // giving up on a hardware encoder that would otherwise work.
+                if (!retriedBelow4K && controller.Current.Height > 1080 && levels.Any(l => l.Height <= 1080))
+                {
+                    retriedBelow4K = true;
+                    observer.OnLog?.Invoke($"{entry.Label} could not start above 1080p; retrying at 1080p.");
+                    // Drop the higher steps too, so auto quality never climbs back into them.
+                    levels = levels.Where(l => l.Height <= 1080).ToArray();
+                    controller = new AdaptiveController(levels, 0, settings.AutoQuality);
                     continue;
+                }
+                retriedBelow4K = false;
+                observer.OnLog?.Invoke($"{entry.Label} could not start: {outcome.Error}");
+                candidateIndex++;
+                controller = null;
+                if (candidateIndex < candidates.Count)
+                    observer.OnLog?.Invoke($"Trying the next encoder: {candidates[candidateIndex].Label}.");
+                continue;
+            }
 
-                busMessages++;
-                if (message.Type == MessageType.Error)
+            if (outputPath is not null) break; // local tests do not reconnect
+
+            reconnects = outcome.HealthyFor > TimeSpan.FromSeconds(60) ? 1 : reconnects + 1;
+            if (reconnects > MaxConsecutiveReconnects) break;
+            var delay = TimeSpan.FromSeconds(Math.Min(15, 2 * reconnects));
+            observer.OnLog?.Invoke($"Stream dropped ({outcome.Error}). Reconnecting in {delay.TotalSeconds:0} s…");
+            if (cancellationToken.WaitHandle.WaitOne(delay)) break;
+        }
+
+        stopwatch.Stop();
+        var completed = everStarted && (lastError is null || cancellationToken.IsCancellationRequested);
+        return new(everStarted, completed, stopwatch.Elapsed, completed ? null : lastError, busMessages, description, metrics.Build());
+    }
+
+    private sealed record SessionOutcome(bool ProducedFrames, TimeSpan HealthyFor, string? Error, bool WindowGone, long BusMessages);
+
+    /// <summary>One pipeline instance with one encoder.</summary>
+    private sealed class Session(
+        WindowTarget target,
+        StreamSettings settings,
+        EncoderCatalog.Entry entry,
+        string factory,
+        string? outputPath,
+        AdaptiveController controller,
+        StreamObserver observer)
+    {
+        private Element? _encoder;
+        private Element? _videoCaps;
+        private bool _systemMemory;
+        private long _encodedFrames;
+        // Held in a field: the native side keeps calling it for every frame.
+        private PadProbeCallback? _countFrames;
+
+        public string Description => $"{(target.SourceKind == VideoSourceKind.Monitor ? $"monitor {target.MonitorIndex}" : $"window 0x{target.Hwnd:X}")} -> {factory} -> {(outputPath is null ? "WHIP " + settings.WhipEndpoint : outputPath)}";
+
+        public SessionOutcome Run(GStreamerEngine engine, System.DateTime deadline, CancellationToken cancellationToken, MetricsRecorder metrics)
+        {
+            long busMessages = 0;
+            Stopwatch? healthy = null;
+            var started = Stopwatch.StartNew();
+            var cpu = new SystemCpuSampler();
+            var network = new NetworkStatsReader(observer);
+            var lastTick = Stopwatch.GetTimestamp();
+            long framesAtLastTick = 0;
+
+            try
+            {
+                engine._pipeline = Build(controller.Current, controller.BitrateKbps);
+                if (engine._pipeline.SetState(State.Playing) == StateChangeReturn.Failure)
+                    return new(false, TimeSpan.Zero, "GStreamer refused to start the pipeline.", false, 0);
+                Report(null);
+
+                var bus = engine._pipeline.Bus ?? throw new InvalidOperationException("Pipeline has no bus.");
+                while (System.DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
                 {
+                    if (!WindowDiscovery.IsAlive(target))
+                        return new(healthy is not null, healthy?.Elapsed ?? TimeSpan.Zero, WindowGoneError, true, busMessages);
+
+                    var frames = Interlocked.Read(ref _encodedFrames);
+                    if (healthy is null && frames > 0) healthy = Stopwatch.StartNew();
+                    if (healthy is null && started.Elapsed > EncoderStartTimeout)
+                        return new(false, TimeSpan.Zero, "the encoder produced no video", false, busMessages);
+
+                    var now = Stopwatch.GetTimestamp();
+                    var interval = (now - lastTick) / (double)Stopwatch.Frequency;
+                    if (interval >= 1 && healthy is not null)
+                    {
+                        metrics.Sample();
+                        var (loss, rtt) = outputPath is null ? network.Read(engine._pipeline) : (null, null);
+                        var sample = new AdaptiveSample(interval, frames - framesAtLastTick, cpu.Sample(), loss, rtt);
+                        observer.OnTrace?.Invoke($"encoded {sample.FramesEncoded / interval:0.0} fps, system CPU {sample.SystemCpuPercent:0}%, loss {(loss is null ? "n/a" : loss.Value.ToString("P1"))}, RTT {(rtt is null ? "n/a" : rtt.Value.ToString("0") + " ms")}");
+                        var decision = controller.Tick(sample);
+                        Apply(decision);
+                        lastTick = now;
+                        framesAtLastTick = frames;
+                    }
+                    else if (healthy is null)
+                    {
+                        lastTick = now;
+                        framesAtLastTick = frames;
+                    }
+
+                    using var message = bus.TimedPopFiltered(100_000_000, MessageType.Error | MessageType.Eos);
+                    if (message is null) continue;
+                    busMessages++;
+                    if (message.Type == MessageType.Eos)
+                        return new(healthy is not null, healthy?.Elapsed ?? TimeSpan.Zero, null, false, busMessages);
+
+                    string error;
                     try
                     {
                         message.ParseError(out var gstError, out var debug);
                         error = $"{gstError.Message} {debug}".Trim();
-                        if (!WindowDiscovery.IsAlive(target))
-                            error = "A janela ou monitor capturado foi fechado, removido ou minimizado; stream encerrado por segurança.";
                     }
                     catch
                     {
-                        error = message.ToString();
+                        error = message.ToString() ?? "unknown GStreamer error";
                     }
-                    message.Dispose();
-                    break;
+                    var gone = !WindowDiscovery.IsAlive(target);
+                    return new(healthy is not null, healthy?.Elapsed ?? TimeSpan.Zero, gone ? WindowGoneError : error, gone, busMessages);
                 }
-
-                if (message.Type == MessageType.Eos)
-                {
-                    message.Dispose();
-                    break;
-                }
-
-                message.Dispose();
+                return new(healthy is not null, healthy?.Elapsed ?? TimeSpan.Zero, null, false, busMessages);
+            }
+            catch (Exception ex)
+            {
+                return new(healthy is not null, healthy?.Elapsed ?? TimeSpan.Zero, ex.GetBaseException().Message, false, busMessages);
+            }
+            finally
+            {
+                metrics.Sample();
+                engine.StopPipeline();
             }
         }
-        catch (Exception ex)
+
+        private void Apply(AdaptiveDecision decision)
         {
-            error = ex.GetBaseException().Message;
-        }
-        finally
-        {
-            SampleProcessMetrics(process, metricSamples, ref lastMetricWall, ref lastMetricCpu);
-            StopPipeline();
-            stopwatch.Stop();
-        }
-
-        var metrics = metricSamples.Count == 0
-            ? null
-            : new RuntimeMetrics(
-                metricSamples.Average(x => x.Cpu),
-                metricSamples.Max(x => x.Cpu),
-                metricSamples.Max(x => x.WorkingSet),
-                (long)process.TotalProcessorTime.TotalMilliseconds,
-                metricSamples.Count);
-        return new(started, started && error is null, stopwatch.Elapsed, error, busMessages, description, metrics);
-    }
-
-    private static void SampleProcessMetrics(Process process, List<(double Cpu, long WorkingSet)> samples, ref long lastWall, ref TimeSpan lastCpu)
-    {
-        var nowWall = Stopwatch.GetTimestamp();
-        var elapsed = (nowWall - lastWall) / (double)Stopwatch.Frequency;
-        if (elapsed < 0.5) return;
-        process.Refresh();
-        var nowCpu = process.TotalProcessorTime;
-        var cpuPercent = Math.Max(0, (nowCpu - lastCpu).TotalSeconds / (elapsed * Math.Max(1, Environment.ProcessorCount)) * 100.0);
-        samples.Add((cpuPercent, process.WorkingSet64));
-        lastWall = nowWall;
-        lastCpu = nowCpu;
-    }
-
-    private static Pipeline BuildWhipPipeline()
-    {
-        var target = PipelineTextBuilder.LastTarget ?? throw new InvalidOperationException("Target ausente.");
-        var settings = PipelineTextBuilder.LastSettings ?? throw new InvalidOperationException("Configuração ausente.");
-        var codec = GetVideoCodec(settings);
-        var pipeline = new Pipeline("streamer-v02-whip");
-
-        var whip = Make("whipsink", "whip", pipeline);
-        Set(whip, "whip-endpoint", settings.WhipEndpoint);
-        Set(whip, "auth-token", settings.BearerToken);
-        Set(whip, "use-link-headers", true);
-
-        var videoElements = BuildVideoSource(target, settings, pipeline, codec.RequiresSystemMemory);
-        var encoder = BuildEncoder(settings, pipeline, "encoder", codec);
-        var parse = Make(codec.ParserFactory, $"{codec.Name}-parse", pipeline);
-        if (codec.Name is "h264" or "h265")
-            Set(parse, "config-interval", -1);
-        var pay = Make(codec.PayloaderFactory, $"{codec.Name}-pay", pipeline);
-        if (codec.Name is "h264" or "h265")
-            Set(pay, "config-interval", -1);
-        Set(pay, "pt", codec.PayloadType);
-        var outputQueue = Make("queue", "encoded-video-queue", pipeline);
-        Set(outputQueue, "max-size-buffers", (uint)2);
-        Set(outputQueue, "leaky", 2);
-        Link(videoElements.Concat(new[] { encoder, parse, pay, outputQueue, whip }).ToArray());
-
-        var audio = Make("wasapi2src", "process-audio", pipeline);
-        Set(audio, "loopback", true);
-        SetAudioLoopback(audio, target, settings);
-        Set(audio, "low-latency", true);
-        var audioConvert = Make("audioconvert", "audio-convert", pipeline);
-        var audioResample = Make("audioresample", "audio-resample", pipeline);
-        var audioCaps = Make("capsfilter", "audio-caps", pipeline);
-        Set(audioCaps, "caps", Caps.FromString("audio/x-raw,format=S16LE,rate=48000,channels=2"));
-        var volume = Make("volume", "audio-gain", pipeline);
-        Set(volume, "volume", settings.AudioGain);
-        var opus = Make("opusenc", "opus", pipeline);
-        Set(opus, "bitrate", settings.AudioBitrateKbps * 1000);
-        Set(opus, "frame-size", 20);
-        var payAudio = Make("rtpopuspay", "opus-pay", pipeline);
-        Set(payAudio, "pt", (uint)97);
-        var audioQueue = Make("queue", "audio-queue", pipeline);
-        Set(audioQueue, "max-size-buffers", (uint)4);
-        Set(audioQueue, "leaky", 2);
-        Link(audio, audioConvert, audioResample, audioCaps, volume, opus, payAudio, audioQueue, whip);
-        return pipeline;
-    }
-
-    private static Pipeline BuildCapturePipeline()
-    {
-        var target = PipelineTextBuilder.LastTarget ?? throw new InvalidOperationException("Target ausente.");
-        var settings = PipelineTextBuilder.LastSettings ?? throw new InvalidOperationException("Configuração ausente.");
-        var outputPath = PipelineTextBuilder.LastOutputPath ?? throw new InvalidOperationException("Arquivo de teste ausente.");
-        var codec = GetVideoCodec(settings);
-        var pipeline = new Pipeline("streamer-v02-capture-test");
-
-        var videoElements = BuildVideoSource(target, settings, pipeline, true);
-        var encoder = BuildEncoder(settings, pipeline, "capture-encoder", codec);
-        var parse = Make(codec.ParserFactory, "test-parse", pipeline);
-        var mux = Make("matroskamux", "test-mux", pipeline);
-        var sink = Make("filesink", "test-file", pipeline);
-        Set(sink, "location", outputPath);
-        Link(videoElements.Concat(new[] { encoder, parse, mux, sink }).ToArray());
-
-        var audio = Make("wasapi2src", "process-audio", pipeline);
-        Set(audio, "loopback", true);
-        SetAudioLoopback(audio, target, settings);
-        Set(audio, "low-latency", true);
-        var audioConvert = Make("audioconvert", "audio-convert", pipeline);
-        var audioResample = Make("audioresample", "audio-resample", pipeline);
-        var audioCaps = Make("capsfilter", "audio-caps", pipeline);
-        Set(audioCaps, "caps", Caps.FromString("audio/x-raw,format=S16LE,rate=48000,channels=2"));
-        var volume = Make("volume", "audio-gain", pipeline);
-        Set(volume, "volume", settings.AudioGain);
-        var opus = Make("opusenc", "opus", pipeline);
-        Set(opus, "bitrate", settings.AudioBitrateKbps * 1000);
-        Set(opus, "frame-size", 20);
-        var audioQueue = Make("queue", "audio-queue", pipeline);
-        Set(audioQueue, "max-size-buffers", (uint)4);
-        Set(audioQueue, "leaky", 2);
-        Link(audio, audioConvert, audioResample, audioCaps, volume, opus, audioQueue, mux);
-        return pipeline;
-    }
-
-    private static List<Element> BuildVideoSource(WindowTarget target, StreamSettings settings, Pipeline pipeline, bool requiresSystemMemory)
-    {
-        var screen = Make("d3d11screencapturesrc", "screen", pipeline);
-        Set(screen, "capture-api", 1);
-        if (target.SourceKind == VideoSourceKind.Monitor)
-        {
-            Set(screen, "monitor-index", target.MonitorIndex);
-        }
-        else
-        {
-            Set(screen, "window-handle", (ulong)target.Hwnd.ToInt64());
-            Set(screen, "window-capture-mode", 1);
-        }
-        Set(screen, "show-cursor", false);
-        var convert = Make("d3d11convert", "gpu-convert", pipeline);
-        var elements = new List<Element> { screen, convert };
-
-        var cpuScale = requiresSystemMemory || settings.Scale is ScaleMethod.Bicubic or ScaleMethod.Lanczos;
-        if (cpuScale)
-        {
-            var download = Make("d3d11download", "gpu-download", pipeline);
-            var cpuConvert = Make("videoconvert", "cpu-convert", pipeline);
-            var scale = Make("videoscale", "cpu-scale", pipeline);
-            Set(scale, "method", VideoScaleMethod(settings.Scale));
-            Set(scale, "n-threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 4));
-            var caps = Make("capsfilter", "system-video-caps", pipeline);
-            Set(caps, "caps", Caps.FromString($"video/x-raw,format=NV12,width={settings.Width},height={settings.Height},framerate={settings.FramesPerSecond}/1"));
-            elements.AddRange([download, cpuConvert, scale, caps]);
-        }
-        else
-        {
-            Set(convert, "method", GpuScaleMethod(settings.Scale));
-            var caps = Make("capsfilter", "gpu-video-caps", pipeline);
-            Set(caps, "caps", Caps.FromString($"video/x-raw(memory:D3D11Memory),format=NV12,width={settings.Width},height={settings.Height},framerate={settings.FramesPerSecond}/1"));
-            elements.Add(caps);
-        }
-
-        var queue = Make("queue", "video-queue", pipeline);
-        Set(queue, "max-size-buffers", (uint)2);
-        Set(queue, "leaky", 2);
-        elements.Add(queue);
-        return elements;
-    }
-
-    private static void SetAudioLoopback(Element audio, WindowTarget target, StreamSettings settings)
-    {
-        // Audio follows the video source by design: a window captures only its
-        // process tree; a monitor captures the system mix excluding Discord.
-        if (target.SourceKind == VideoSourceKind.Monitor)
-        {
-            var discordPid = WindowDiscovery.FindDiscordRootPid()
-                ?? throw new InvalidOperationException("Discord was not found. Start Discord first or choose Selected app audio.");
-            Set(audio, "loopback-mode", 2); // exclude-process-tree
-            Set(audio, "loopback-target-pid", (uint)discordPid);
-            return;
-        }
-
-        if (target.SourceKind != VideoSourceKind.Window || target.ProcessId <= 0)
-            throw new InvalidOperationException("Selected app audio requires an application window. Choose System audio (except Discord) for a full-monitor capture.");
-
-        Set(audio, "loopback-mode", 1); // include-process-tree
-        Set(audio, "loopback-target-pid", (uint)target.ProcessId);
-    }
-
-    private static Element BuildEncoder(StreamSettings settings, Pipeline pipeline, string name, VideoCodecInfo codec)
-    {
-        var gop = Math.Max(1, settings.KeyframeIntervalSeconds * settings.FramesPerSecond);
-        if (settings.Encoder is EncoderKind.H264Nvenc or EncoderKind.HevcNvenc)
-        {
-            if (settings.RateControl == RateControl.Crf)
-                throw new NotSupportedException("CRF não existe no NVENC; use CBR, VBR ou CQP.");
-            var encoder = Make(codec.EncoderFactory, name, pipeline);
-            SetNvencRateControl(encoder, settings.RateControl);
-            Set(encoder, "bitrate", (uint)settings.VideoBitrateKbps);
-            Set(encoder, "preset", NvencPresetValue(settings.EncoderPreset));
-            Set(encoder, "tune", 3);
-            SetNvencBFrames(encoder, settings.BFrames);
-            Set(encoder, "rc-lookahead", (uint)0);
-            Set(encoder, "gop-size", gop);
-            SetNvencZeroLatency(encoder);
-            Set(encoder, "repeat-sequence-header", true);
-            return encoder;
-        }
-
-        if (settings.Encoder == EncoderKind.Av1Nvenc)
-        {
-            if (settings.RateControl == RateControl.Crf)
-                throw new NotSupportedException("CRF não existe no AV1 NVENC; use CBR, VBR ou CQP.");
-            var encoder = Make(codec.EncoderFactory, name, pipeline);
-            SetNvencRateControl(encoder, settings.RateControl);
-            Set(encoder, "bitrate", (uint)settings.VideoBitrateKbps);
-            Set(encoder, "preset", NvencPresetValue(settings.EncoderPreset));
-            Set(encoder, "tune", 3);
-            SetNvencBFrames(encoder, settings.BFrames);
-            Set(encoder, "rc-lookahead", (uint)0);
-            Set(encoder, "gop-size", gop);
-            Set(encoder, "zerolatency", true);
-            return encoder;
-        }
-
-        if (settings.Encoder == EncoderKind.H264X264)
-        {
-            var encoder = Make("x264enc", name, pipeline);
-            Set(encoder, "speed-preset", X264PresetValue(settings.EncoderPreset));
-            Set(encoder, "tune", 4);
-            Set(encoder, "bframes", (uint)settings.BFrames);
-            Set(encoder, "key-int-max", gop);
-            Set(encoder, "rc-lookahead", 0);
-            Set(encoder, "sync-lookahead", 0);
-            Set(encoder, "sliced-threads", true);
-            Set(encoder, "threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 8));
-            Set(encoder, "option-string", $"vbv-maxrate={settings.VideoBitrateKbps}:vbv-bufsize={Math.Max(settings.VideoBitrateKbps * 2, 100)}");
-            if (settings.RateControl == RateControl.Crf)
+            if (decision.NewLevel is { } level && _videoCaps is not null)
             {
-                Set(encoder, "pass", 5);
-                Set(encoder, "quantizer", (uint)Math.Clamp(settings.Crf, 0, 50));
+                // Changing the caps renegotiates scaler and encoder in place;
+                // the WHIP session and the viewers' connection stay up.
+                _videoCaps["caps"] = VideoCaps(level);
+            }
+            if (decision.NewBitrateKbps is { } kbps && _encoder is not null)
+                EncoderCatalog.SetBitrate(_encoder, entry, kbps);
+            if (decision.NewLevel is not null || decision.NewBitrateKbps is not null)
+            {
+                if (decision.Reason is not null)
+                    observer.OnLog?.Invoke($"Auto quality: {(decision.NewLevel is not null ? $"{controller.Current.Width}x{controller.Current.Height}@{controller.Current.FramesPerSecond}, " : "")}{controller.BitrateKbps} kbps — {decision.Reason}.");
+                Report(decision.Reason);
+            }
+        }
+
+        private void Report(string? reason)
+        {
+            var level = controller.Current;
+            observer.OnInfo?.Invoke(new LiveStreamInfo(entry.Label, level.Width, level.Height, level.FramesPerSecond, controller.BitrateKbps, reason));
+        }
+
+        private Caps VideoCaps(QualityLevel level) => Caps.FromString(
+            $"video/x-raw{(_systemMemory ? "" : "(memory:D3D11Memory)")},format=NV12,width={level.Width},height={level.Height},framerate={level.FramesPerSecond}/1");
+
+        private Pipeline Build(QualityLevel level, int bitrateKbps)
+        {
+            var pipeline = new Pipeline("streamer-v02");
+            var screen = Make("d3d11screencapturesrc", "screen", pipeline);
+            Set(screen, "capture-api", 1); // Windows Graphics Capture
+            if (target.SourceKind == VideoSourceKind.Monitor)
+            {
+                Set(screen, "monitor-index", target.MonitorIndex);
             }
             else
             {
-                Set(encoder, "pass", 0);
-                Set(encoder, "bitrate", (uint)settings.VideoBitrateKbps);
+                Set(screen, "window-handle", (ulong)target.Hwnd.ToInt64());
+                Set(screen, "window-capture-mode", 1); // client area
             }
-            return encoder;
+            Set(screen, "show-cursor", target.SourceKind == VideoSourceKind.Monitor);
+
+            var convert = Make("d3d11convert", "gpu-convert", pipeline);
+            var video = new List<Element> { screen, convert };
+            // Lanczos/Bicubic exist only as CPU filters; everything else keeps
+            // frames on the GPU from capture to encoder with no copies.
+            _systemMemory = !entry.AcceptsD3D11 ||
+                            (!settings.AutoQuality && settings.Scale is ScaleMethod.Bicubic or ScaleMethod.Lanczos);
+            if (_systemMemory)
+            {
+                var download = Make("d3d11download", "gpu-download", pipeline);
+                var cpuConvert = Make("videoconvert", "cpu-convert", pipeline);
+                var scale = Make("videoscale", "cpu-scale", pipeline);
+                Set(scale, "method", settings.AutoQuality ? 1 : VideoScaleMethod(settings.Scale));
+                Set(scale, "n-threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 4));
+                Set(cpuConvert, "n-threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 4));
+                video.AddRange([download, cpuConvert, scale]);
+            }
+            else
+            {
+                Set(convert, "method", settings.Scale == ScaleMethod.None && !settings.AutoQuality ? 0 : 1);
+            }
+            _videoCaps = Make("capsfilter", "video-caps", pipeline);
+            _videoCaps["caps"] = VideoCaps(level);
+            video.Add(_videoCaps);
+
+            var queue = Make("queue", "video-queue", pipeline);
+            Set(queue, "max-size-buffers", (uint)2);
+            Set(queue, "max-size-bytes", (uint)0);
+            Set(queue, "max-size-time", (ulong)0);
+            Set(queue, "leaky", 2); // drop old frames instead of building latency
+            video.Add(queue);
+
+            _encoder = Make(factory, "encoder", pipeline);
+            EncoderCatalog.Configure(_encoder, entry, settings, bitrateKbps, level.FramesPerSecond);
+            _countFrames = (_, _) =>
+            {
+                Interlocked.Increment(ref _encodedFrames);
+                return PadProbeReturn.Ok;
+            };
+            _encoder.GetStaticPad("src").AddProbe(PadProbeType.Buffer, _countFrames);
+            video.Add(_encoder);
+
+            var parse = Make(entry.Codec switch { "h265" => "h265parse", "av1" => "av1parse", _ => "h264parse" }, "parse", pipeline);
+            if (entry.Codec != "av1") Set(parse, "config-interval", -1);
+            video.Add(parse);
+
+            var audio = BuildAudio(pipeline);
+            if (outputPath is null)
+            {
+                var whip = Make("whipsink", "whip", pipeline);
+                Set(whip, "whip-endpoint", settings.WhipEndpoint);
+                Set(whip, "auth-token", settings.BearerToken);
+                Set(whip, "use-link-headers", true);
+
+                var pay = Make(entry.Codec switch { "h265" => "rtph265pay", "av1" => "rtpav1pay", _ => "rtph264pay" }, "video-pay", pipeline);
+                if (entry.Codec != "av1") Set(pay, "config-interval", -1);
+                Set(pay, "pt", entry.Codec switch { "h265" => 98u, "av1" => 99u, _ => 96u });
+                var outQueue = PacketQueue("encoded-video-queue", pipeline);
+                video.AddRange([pay, outQueue, whip]);
+
+                var payAudio = Make("rtpopuspay", "opus-pay", pipeline);
+                Set(payAudio, "pt", 97u);
+                audio.AddRange([payAudio, PacketQueue("audio-queue", pipeline), whip]);
+            }
+            else
+            {
+                var mux = Make("matroskamux", "mux", pipeline);
+                var sink = Make("filesink", "file", pipeline);
+                Set(sink, "location", outputPath);
+                video.AddRange([mux, sink]);
+                // A file never stalls like a network, so keep every audio
+                // buffer while the muxer waits for the first video frame.
+                var audioQueue = Make("queue", "audio-queue", pipeline);
+                Set(audioQueue, "max-size-time", 2_000_000_000ul);
+                audio.AddRange([audioQueue, mux]);
+            }
+
+            Link(video);
+            Link(audio);
+            return pipeline;
         }
 
-        throw new NotSupportedException($"Encoder {settings.Encoder} não está disponível neste bundle. Escolha um encoder habilitado na lista.");
-    }
-
-    private static VideoCodecInfo GetVideoCodec(StreamSettings settings)
-    {
-        var codec = settings.Encoder switch
+        private List<Element> BuildAudio(Pipeline pipeline)
         {
-            EncoderKind.H264Nvenc => new VideoCodecInfo("h264", "nvd3d11h264enc", "h264parse", "rtph264pay", 96, false, true),
-            EncoderKind.H264X264 => new VideoCodecInfo("h264", "x264enc", "h264parse", "rtph264pay", 96, true, false),
-            EncoderKind.HevcNvenc => new VideoCodecInfo("h265", "nvd3d11h265enc", "h265parse", "rtph265pay", 98, false, true),
-            EncoderKind.Av1Nvenc => Av1Codec(),
-            _ => throw new NotSupportedException($"Encoder {settings.Encoder} não está disponível neste bundle. Escolha um encoder habilitado na lista.")
-        };
+            var source = Make("wasapi2src", "audio-source", pipeline);
+            Set(source, "loopback", true);
+            Set(source, "low-latency", true);
+            // Audio follows the video source by design: a window captures only
+            // its process tree; a monitor captures the system mix minus Discord.
+            if (target.SourceKind == VideoSourceKind.Monitor)
+            {
+                var discordPid = WindowDiscovery.FindDiscordRootPid()
+                    ?? throw new InvalidOperationException("Discord was not found. Start Discord first, or capture an application window instead.");
+                Set(source, "loopback-mode", 2); // exclude-process-tree
+                Set(source, "loopback-target-pid", (uint)discordPid);
+            }
+            else
+            {
+                if (target.ProcessId <= 0)
+                    throw new InvalidOperationException("Selected app audio requires an application window.");
+                Set(source, "loopback-mode", 1); // include-process-tree
+                Set(source, "loopback-target-pid", (uint)target.ProcessId);
+            }
 
-        if (!HasFactory(codec.EncoderFactory))
-            throw new NotSupportedException($"O encoder {settings.Encoder} exige o plugin GStreamer {codec.EncoderFactory}, que não está disponível nesta release.");
-        return codec;
+            var convert = Make("audioconvert", "audio-convert", pipeline);
+            var resample = Make("audioresample", "audio-resample", pipeline);
+            var caps = Make("capsfilter", "audio-caps", pipeline);
+            caps["caps"] = Caps.FromString("audio/x-raw,format=S16LE,rate=48000,channels=2");
+            var volume = Make("volume", "audio-gain", pipeline);
+            Set(volume, "volume", settings.AudioGain);
+            var opus = Make("opusenc", "opus", pipeline);
+            Set(opus, "bitrate", settings.AudioBitrateKbps * 1000);
+            Set(opus, "frame-size", 20);
+            return [source, convert, resample, caps, volume, opus];
+        }
+
+        /// <summary>
+        /// Queue in front of the network sink. One video frame is many RTP
+        /// packets (a keyframe can be dozens), so a count-limited leaky queue
+        /// drops pieces of frames and viewers see corruption until the next
+        /// keyframe. Bound it by time instead: it only drops when the network
+        /// has been stalled for longer than a viewer would tolerate anyway.
+        /// </summary>
+        private static Element PacketQueue(string name, Pipeline pipeline)
+        {
+            var queue = Make("queue", name, pipeline);
+            Set(queue, "max-size-buffers", 0u);
+            Set(queue, "max-size-bytes", 0u);
+            Set(queue, "max-size-time", 300_000_000ul);
+            Set(queue, "leaky", 2);
+            return queue;
+        }
     }
 
-    private static VideoCodecInfo Av1Codec()
+    /// <summary>
+    /// Reads packet loss and RTT from the RTCP receiver reports webrtcbin
+    /// collects inside whipsink. Worst stream wins: losing audio is as bad as
+    /// losing video.
+    /// </summary>
+    private sealed class NetworkStatsReader(StreamObserver observer)
     {
-        var factory = FindAv1EncoderFactory()
-            ?? throw new NotSupportedException("AV1 NVENC exige GStreamer 1.26+ com nvd3d11av1enc/nvautogpuav1enc/nvav1enc; esta instalação não expõe um encoder AV1 NVIDIA por hardware.");
-        // The CUDA-only factory accepts system memory, while the D3D11 and
-        // auto-GPU factories can stay on the capture device without a download.
-        return new VideoCodecInfo("av1", factory, "av1parse", "rtpav1pay", 99, factory == "nvav1enc", true);
+        private readonly Dictionary<uint, (ulong Sent, long Lost)> _previous = [];
+        private Element? _webrtc;
+        private bool _unavailable;
+
+        public (double? Loss, double? RttMs) Read(Pipeline pipeline)
+        {
+            if (_unavailable) return (null, null);
+            try
+            {
+                _webrtc ??= FindWebRtcBin(pipeline);
+                if (_webrtc is null) return (null, null);
+
+                // The managed signal wrapper rejects a null or ghost pad, so
+                // emit directly: a NULL pad returns stats for every stream.
+                using var promise = new Promise();
+                g_signal_emit_by_name(_webrtc.Handle, "get-stats", nint.Zero, promise.Handle, nint.Zero);
+                if (promise.Wait() != PromiseResult.Replied) return (null, null);
+                var reply = promise.RetrieveReply();
+                if (reply is null) return (null, null);
+
+                // Cumulative counters per SSRC: packets we sent (outbound-rtp)
+                // and packets the server reports lost (remote-inbound-rtp).
+                var sent = new Dictionary<uint, ulong>();
+                var lost = new Dictionary<uint, long>();
+                double? rtt = null;
+                for (uint i = 0; i < (uint)reply.NFields(); i++)
+                {
+                    if (reply.GetValue(reply.NthFieldName(i)).Val is not Structure stat || !stat.GetUint("ssrc", out var ssrc))
+                        continue;
+                    if (stat.Name.StartsWith("outbound-rtp", StringComparison.Ordinal) && stat.GetUint64("packets-sent", out var packets))
+                        sent[ssrc] = packets;
+                    if (!stat.Name.StartsWith("remote-inbound-rtp", StringComparison.Ordinal)) continue;
+                    if (stat.GetInt64("packets-lost", out var packetsLost))
+                        lost[ssrc] = packetsLost;
+                    // Broadcast Box (Pion) omits the RTCP timing fields, so
+                    // RTT is often 0; only trust it when the server fills it.
+                    if (stat.GetDouble("round-trip-time", out var seconds) && seconds > 0)
+                        rtt = Math.Max(rtt ?? 0, seconds * 1000);
+                }
+
+                // The receiver's own "fraction-lost" is unreliable here (it
+                // freezes on startup losses), so measure loss over the packets
+                // sent since the last report: worst stream wins.
+                double? loss = null;
+                foreach (var (ssrc, packetsLost) in lost)
+                {
+                    if (!sent.TryGetValue(ssrc, out var packetsSent)) continue;
+                    if (_previous.TryGetValue(ssrc, out var before) && packetsSent > before.Sent)
+                    {
+                        var window = packetsSent - before.Sent;
+                        if (window < 60 && packetsLost == before.Lost) continue; // too few packets to judge yet
+                        var fraction = Math.Clamp((packetsLost - before.Lost) / (double)window, 0, 1);
+                        loss = Math.Max(loss ?? 0, fraction);
+                    }
+                    _previous[ssrc] = (packetsSent, packetsLost);
+                }
+                return (loss, rtt);
+            }
+            catch (Exception ex)
+            {
+                // Stats are an optimisation; never let them stop a stream.
+                observer.OnTrace?.Invoke("WebRTC stats unavailable: " + ex.GetBaseException().Message);
+                _unavailable = true;
+                return (null, null);
+            }
+        }
+
+        // Variadic in C, but on x64 Windows pointer-sized varargs use the
+        // regular calling convention; the trailing zero is a harmless extra.
+        [DllImport("gobject-2.0-0.dll", CharSet = CharSet.Ansi)]
+        private static extern void g_signal_emit_by_name(nint instance, string signal, nint pad, nint promise, nint terminator);
+
+        private static Element? FindWebRtcBin(Pipeline pipeline)
+        {
+            var iterator = pipeline.IterateAllByElementFactoryName("webrtcbin");
+            var value = new GLib.Value();
+            return iterator.Next(ref value) == IteratorResult.Ok ? value.Val as Element : null;
+        }
+    }
+
+    /// <summary>Whole-machine CPU load, so a game eating the CPU counts too.</summary>
+    private sealed class SystemCpuSampler
+    {
+        private ulong _idle, _total;
+
+        public double Sample()
+        {
+            if (!GetSystemTimes(out var idle, out var kernel, out var user)) return 0;
+            var total = kernel + user; // kernel time includes idle time
+            var (deltaIdle, deltaTotal) = (idle - _idle, total - _total);
+            var first = _total == 0;
+            (_idle, _total) = (idle, total);
+            return first || deltaTotal == 0 ? 0 : Math.Clamp(100.0 * (deltaTotal - deltaIdle) / deltaTotal, 0, 100);
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemTimes(out ulong idle, out ulong kernel, out ulong user);
+    }
+
+    private sealed class MetricsRecorder
+    {
+        private readonly Process _process = Process.GetCurrentProcess();
+        private readonly List<(double Cpu, long WorkingSet)> _samples = [];
+        private long _lastWall = Stopwatch.GetTimestamp();
+        private TimeSpan _lastCpu = Process.GetCurrentProcess().TotalProcessorTime;
+
+        public void Sample()
+        {
+            var now = Stopwatch.GetTimestamp();
+            var elapsed = (now - _lastWall) / (double)Stopwatch.Frequency;
+            if (elapsed < 0.5) return;
+            _process.Refresh();
+            var cpu = _process.TotalProcessorTime;
+            _samples.Add((Math.Max(0, (cpu - _lastCpu).TotalSeconds / (elapsed * Environment.ProcessorCount) * 100), _process.WorkingSet64));
+            (_lastWall, _lastCpu) = (now, cpu);
+        }
+
+        public RuntimeMetrics? Build() => _samples.Count == 0
+            ? null
+            : new(_samples.Average(s => s.Cpu), _samples.Max(s => s.Cpu), _samples.Max(s => s.WorkingSet),
+                (long)_process.TotalProcessorTime.TotalMilliseconds, _samples.Count);
     }
 
     private static Element Make(string factory, string name, Pipeline pipeline)
     {
         var element = ElementFactory.Make(factory, name)
-            ?? throw new InvalidOperationException($"Plugin GStreamer ausente: {factory}");
+            ?? throw new InvalidOperationException($"Missing GStreamer plugin: {factory}");
         if (!pipeline.Add(element))
-            throw new InvalidOperationException($"Não consegui adicionar {factory} ao pipeline.");
+            throw new InvalidOperationException($"Could not add {factory} to the pipeline.");
         return element;
     }
 
     private static void Set(Element element, string property, object value)
     {
         try { element[property] = value; }
-        catch (Exception ex) { throw new InvalidOperationException($"Falha configurando {element.Name}.{property}: {ex.Message}", ex); }
+        catch (Exception ex) { throw new InvalidOperationException($"Failed to set {element.Name}.{property}: {ex.Message}", ex); }
     }
 
-    private static void SetNvencRateControl(Element element, RateControl rateControl)
+    private static void Link(IReadOnlyList<Element> elements)
     {
-        // GStreamer 1.26+ exposes the common NVENC property as rc-mode with
-        // GstNvEncoderRCMode values. Older bundles used rate-control and a
-        // different enum numbering. Keep both mappings correct so a locally
-        // built app does not silently turn CQP/VBR into the wrong mode.
-        if (HasProperty(element, "rc-mode"))
-        {
-            Set(element, "rc-mode", rateControl switch
-            {
-                RateControl.Cqp => 1, // constqp
-                RateControl.Vbr => 3, // vbr
-                _ => 2                // cbr
-            });
-            return;
-        }
-
-        if (HasProperty(element, "rate-control"))
-        {
-            Set(element, "rate-control", rateControl switch
-            {
-                RateControl.Cqp => 0,
-                RateControl.Vbr => 1,
-                _ => 2
-            });
-            return;
-        }
-
-        throw new NotSupportedException($"O encoder {element.Name} não expõe uma propriedade de rate control NVENC conhecida.");
-    }
-
-    private static void SetNvencBFrames(Element element, int bFrames)
-    {
-        if (HasProperty(element, "bframes"))
-        {
-            Set(element, "bframes", (uint)bFrames);
-            return;
-        }
-
-        Set(element, "b-frames", (uint)bFrames);
-    }
-
-    private static void SetNvencZeroLatency(Element element)
-    {
-        if (HasProperty(element, "zerolatency"))
-        {
-            Set(element, "zerolatency", true);
-            return;
-        }
-
-        Set(element, "zero-reorder-delay", true);
-    }
-
-    private static bool HasProperty(Element element, string property)
-    {
-        try
-        {
-            element.GetProperty(property);
-            return true;
-        }
-        catch (PropertyNotFoundException)
-        {
-            return false;
-        }
-    }
-
-    private static void Link(params Element[] elements)
-    {
-        for (var i = 0; i + 1 < elements.Length; i++)
+        for (var i = 0; i + 1 < elements.Count; i++)
             if (!elements[i].Link(elements[i + 1]))
-                throw new InvalidOperationException($"Falha ligando {elements[i].Name} -> {elements[i + 1].Name}.");
+                throw new InvalidOperationException($"Could not link {elements[i].Name} -> {elements[i + 1].Name}.");
     }
-
-    private static int NvencPresetValue(string preset) => preset.ToLowerInvariant() switch
-    {
-        "p1" => 8, "p2" => 9, "p3" => 10, "p4" => 11, "p5" => 12, "p6" => 13, "p7" => 14,
-        "low-latency" => 3, "low-latency-hq" => 4, "low-latency-hp" => 5, _ => 8
-    };
-
-    private static int X264PresetValue(string preset) => preset.ToLowerInvariant() switch
-    {
-        "ultrafast" => 1, "superfast" => 2, "veryfast" => 3, "faster" => 4,
-        "fast" => 5, "medium" => 6, "slow" => 7, "slower" => 8, "veryslow" => 9,
-        "placebo" => 10, _ => 1
-    };
 
     private static int VideoScaleMethod(ScaleMethod method) => method switch
     {
         ScaleMethod.None => 0,
-        ScaleMethod.Bilinear => 1,
         ScaleMethod.Bicubic => 8,
         ScaleMethod.Lanczos => 3,
-        _ => 1
-    };
-
-    private static int GpuScaleMethod(ScaleMethod method) => method switch
-    {
-        ScaleMethod.None => 0,
         _ => 1
     };
 
@@ -591,89 +662,4 @@ public sealed class GStreamerEngine : IDisposable
         _disposed = true;
         StopPipeline();
     }
-}
-
-internal static class PipelineTextBuilder
-{
-    public static WindowTarget? LastTarget { get; private set; }
-    public static StreamSettings? LastSettings { get; private set; }
-    public static string? LastOutputPath { get; private set; }
-
-    public static string BuildWindowWhip(WindowTarget target, StreamSettings settings)
-    {
-        LastTarget = target;
-        LastSettings = settings;
-        LastOutputPath = null;
-        var endpoint = Quote(settings.WhipEndpoint);
-        var token = Quote(settings.BearerToken);
-        var fps = settings.FramesPerSecond;
-        var codec = CodecText(settings);
-        var videoCaps = codec.Name switch
-        {
-            "h264" => "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
-            "h265" => "video/x-h265,stream-format=byte-stream,alignment=au",
-            _ => "video/x-av1,stream-format=obu-stream,alignment=tu"
-        };
-
-        var source = target.SourceKind == VideoSourceKind.Monitor
-            ? $"d3d11screencapturesrc name=screen capture-api=wgc monitor-index={target.MonitorIndex} show-cursor=false"
-            : $"d3d11screencapturesrc name=screen capture-api=wgc window-handle={target.Hwnd.ToInt64()} window-capture-mode=client show-cursor=false";
-        var audio = AudioText(settings, target);
-        return $"whipsink whip-endpoint={endpoint} auth-token={token} use-link-headers=true " +
-               $"{source} ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,width={settings.Width},height={settings.Height},framerate={fps}/1 ! queue max-size-buffers=2 leaky=downstream ! {codec.Encoder} ! {codec.Parser} ! {codec.Payloader} pt={codec.PayloadType} ! {videoCaps} ! queue max-size-buffers=2 leaky=downstream ! whip. " +
-               $"{audio} ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! volume volume={settings.AudioGain.ToString(CultureInfo.InvariantCulture)} ! opusenc bitrate={settings.AudioBitrateKbps * 1000} frame-size=20 ! audio/x-opus,rate=48000,channels=2 ! queue max-size-buffers=4 leaky=downstream ! whip.";
-    }
-
-    public static string BuildLocalCapture(WindowTarget target, StreamSettings settings, string outputPath)
-    {
-        LastTarget = target;
-        LastSettings = settings;
-        LastOutputPath = Path.GetFullPath(outputPath);
-        var codec = CodecText(settings);
-        var source = target.SourceKind == VideoSourceKind.Monitor
-            ? $"d3d11screencapturesrc capture-api=wgc monitor-index={target.MonitorIndex} show-cursor=false"
-            : $"d3d11screencapturesrc capture-api=wgc window-handle={target.Hwnd.ToInt64()} window-capture-mode=client show-cursor=false";
-        var audio = AudioText(settings, target);
-        return $"{source} ! d3d11convert ! d3d11download ! videoconvert ! videoscale method={settings.Scale.ToString().ToLowerInvariant()} ! video/x-raw,format=NV12,width={settings.Width},height={settings.Height},framerate={settings.FramesPerSecond}/1 ! queue max-size-buffers=2 leaky=downstream ! {codec.Encoder} ! {codec.Parser} ! matroskamux ! filesink location=\"{LastOutputPath}\" " +
-               $"{audio} ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! volume volume={settings.AudioGain.ToString(CultureInfo.InvariantCulture)} ! opusenc bitrate={settings.AudioBitrateKbps * 1000} frame-size=20 ! matroskamux.";
-    }
-
-    private static string AudioText(StreamSettings settings, WindowTarget target)
-    {
-        if (target.SourceKind == VideoSourceKind.Monitor)
-        {
-            var discordPid = WindowDiscovery.FindDiscordRootPid()
-                ?? throw new InvalidOperationException("Discord was not found. Start Discord first or choose Selected app audio.");
-            return $"wasapi2src loopback=true loopback-mode=exclude-process-tree loopback-target-pid={discordPid} low-latency=true";
-        }
-
-        if (target.SourceKind != VideoSourceKind.Window || target.ProcessId <= 0)
-            throw new InvalidOperationException("Selected app audio requires an application window. Choose System audio (except Discord) for a full-monitor capture.");
-        return $"wasapi2src loopback=true loopback-mode=include-process-tree loopback-target-pid={target.ProcessId} low-latency=true";
-    }
-
-    private sealed record CodecTextInfo(string Name, string Encoder, string Parser, string Payloader, uint PayloadType);
-
-    private static CodecTextInfo CodecText(StreamSettings settings)
-    {
-        var preset = string.IsNullOrWhiteSpace(settings.EncoderPreset) ? "p1" : settings.EncoderPreset;
-        var gop = Math.Max(1, settings.KeyframeIntervalSeconds * settings.FramesPerSecond);
-        return settings.Encoder switch
-        {
-            EncoderKind.H264X264 => new("h264", $"x264enc speed-preset={preset} tune=zerolatency bframes={settings.BFrames} key-int-max={gop} rc-lookahead=0 sync-lookahead=0 sliced-threads=true", "h264parse config-interval=-1", "rtph264pay config-interval=-1", 96),
-            EncoderKind.H264Nvenc => new("h264", $"nvd3d11h264enc rc-mode={NvencRateControlText(settings.RateControl)} bitrate={settings.VideoBitrateKbps} preset={preset} tune=ultra-low-latency bframes={settings.BFrames} rc-lookahead=0 gop-size={gop} zerolatency=true repeat-sequence-header=true", "h264parse config-interval=-1", "rtph264pay config-interval=-1", 96),
-            EncoderKind.HevcNvenc => new("h265", $"nvd3d11h265enc rc-mode={NvencRateControlText(settings.RateControl)} bitrate={settings.VideoBitrateKbps} preset={preset} tune=ultra-low-latency bframes={settings.BFrames} rc-lookahead=0 gop-size={gop} zerolatency=true repeat-sequence-header=true", "h265parse config-interval=-1", "rtph265pay config-interval=-1", 98),
-            EncoderKind.Av1Nvenc => new("av1", $"nvd3d11av1enc rc-mode={NvencRateControlText(settings.RateControl)} bitrate={settings.VideoBitrateKbps} preset={preset} tune=ultra-low-latency bframes={settings.BFrames} rc-lookahead=0 gop-size={gop} zerolatency=true", "av1parse", "rtpav1pay", 99),
-            _ => throw new NotSupportedException($"Encoder {settings.Encoder} não está disponível neste bundle.")
-        };
-    }
-
-    private static string NvencRateControlText(RateControl rateControl) => rateControl switch
-    {
-        RateControl.Cqp => "constqp",
-        RateControl.Vbr => "vbr",
-        _ => "cbr"
-    };
-
-    private static string Quote(string value) => "\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 }

@@ -11,9 +11,10 @@ if (args.Length == 0)
     var uiThread = new Thread(() =>
     {
         ApplicationConfiguration.Initialize();
-        // GStreamer may initialize COM as MTA. Keep that away from the UI STA.
-        Task.Run(GStreamerEngine.Initialize).GetAwaiter().GetResult();
-        Application.Run(new MainForm());
+        // GStreamer may initialize COM as MTA. Keep that away from the UI STA,
+        // and let it load in parallel with WebView2 instead of before the window.
+        var gstreamerReady = Task.Run(GStreamerEngine.Initialize);
+        Application.Run(new MainForm(gstreamerReady));
     });
     uiThread.SetApartmentState(ApartmentState.STA);
     uiThread.Start();
@@ -28,6 +29,13 @@ if (arguments.Contains("--list-windows", StringComparer.OrdinalIgnoreCase))
 {
     foreach (var window in WindowDiscovery.List())
         Console.WriteLine($"0x{window.Hwnd.ToInt64():X}\tPID={window.ProcessId}\t{window.ProcessName}\t{window.DisplayName}");
+    return 0;
+}
+
+if (arguments.Contains("--list-encoders", StringComparer.OrdinalIgnoreCase))
+{
+    foreach (var option in GStreamerEngine.GetEncoderOptions())
+        Console.WriteLine($"{option.Value}	{(option.Available ? "yes" : "no")}	{option.Reason}");
     return 0;
 }
 
@@ -59,7 +67,11 @@ var settings = Presets.StableOldPc with
     VideoSource = GetEnum(arguments, "--video-source", Presets.StableOldPc.VideoSource),
     MonitorIndex = GetInt(arguments, "--monitor-index", Presets.StableOldPc.MonitorIndex),
     AudioSource = GetEnum(arguments, "--audio-source",
-        GetEnum(arguments, "--audio-mode", Presets.StableOldPc.AudioSource))
+        GetEnum(arguments, "--audio-mode", Presets.StableOldPc.AudioSource)),
+    Mode = GetEnum(arguments, "--mode", Presets.StableOldPc.Mode),
+    // Explicit --width/--height/--video-kbps imply manual quality unless overridden.
+    AutoQuality = GetBool(arguments, "--auto-quality",
+        GetOptionalString(arguments, "--width") is null && GetOptionalString(arguments, "--video-kbps") is null)
 };
 
 var target = ResolveTarget(arguments, settings);
@@ -80,11 +92,11 @@ StreamRunResult result;
 if (arguments.Contains("--capture", StringComparer.OrdinalIgnoreCase))
 {
     var output = GetString(arguments, "--output", Path.Combine(AppContext.BaseDirectory, "capture-test.mkv"));
-    result = engine.RunWindowCaptureTest(target, settings, duration, output, cancellation.Token);
+    result = engine.RunWindowCaptureTest(target, settings, duration, output, cancellation.Token, StreamObserver.Console);
 }
 else if (arguments.Contains("--stream", StringComparer.OrdinalIgnoreCase))
 {
-    result = engine.RunWindowStream(target, settings, duration, cancellation.Token);
+    result = engine.RunWindowStream(target, settings, duration, cancellation.Token, StreamObserver.Console);
 }
 else
 {
@@ -132,6 +144,12 @@ static double GetDouble(List<string> args, string name, double fallback)
 {
     var value = GetOptionalString(args, name);
     return value is not null && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : fallback;
+}
+
+static bool GetBool(List<string> args, string name, bool fallback)
+{
+    var value = GetOptionalString(args, name);
+    return value is not null && bool.TryParse(value, out var parsed) ? parsed : fallback;
 }
 
 static string GetString(List<string> args, string name, string fallback) => GetOptionalString(args, name) ?? fallback;
