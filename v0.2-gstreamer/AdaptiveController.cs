@@ -37,10 +37,12 @@ public sealed class AdaptiveController
     // Broadcast Box reports a steady few percent of "loss" tied to keyframes
     // even on a clean link, so congestion is loss rising above this
     // connection's own baseline (or plainly high loss), sustained.
-    private const double LossAboveBaselineCongested = 0.06;
+    private const double LossAboveBaselineCongested = 0.03;
     private const double LossAlwaysCongested = 0.15;
     private const double LossAboveBaselineClean = 0.02;
     private const int CongestedSamplesToAct = 2;
+    // One burst this large is already a visible freeze for viewers; do not wait for a second sample.
+    private const double LossSpikeActsImmediately = 0.08;
     private const double RttCongestionMarginMs = 250;
     private const double MinNetworkFactor = 0.35;
 
@@ -57,6 +59,11 @@ public sealed class AdaptiveController
     private double _calmSeconds;
     private double _cleanNetworkSeconds;
     private double _networkFactor = 1;
+    // Bitrate share (of the level's target) that caused loss last time. Probing
+    // back to full speed within seconds just hits the same wall again, so the
+    // ceiling sits a bit under the failing point and relaxes slowly.
+    private double _factorCeiling = 1;
+    private double _lastCeilingRelax;
     private double _baseRttMs = double.MaxValue;
     private double _baseLoss = double.MaxValue;
     private int _congestedSamples;
@@ -124,7 +131,7 @@ public sealed class AdaptiveController
             return ChangeLevel(_index + 1, "upload is congested");
         }
 
-        if (_index > _ceilingIndex && canChangeLevel && _calmSeconds >= CalmSecondsToStepUp && _networkFactor >= 0.95)
+        if (_index > _ceilingIndex && canChangeLevel && _calmSeconds >= CalmSecondsToStepUp && _networkFactor >= 0.95 && _factorCeiling >= 0.95)
         {
             _lastStepUp = _now;
             _calmSeconds = 0;
@@ -155,9 +162,11 @@ public sealed class AdaptiveController
         }
 
         var congested = excessLoss >= LossAboveBaselineCongested || rttCongested;
-        _congestedSamples = congested ? _congestedSamples + 1 : 0;
+        _congestedSamples = excessLoss >= LossSpikeActsImmediately ? CongestedSamplesToAct : congested ? _congestedSamples + 1 : 0;
         if (_congestedSamples >= CongestedSamplesToAct && _now - _lastNetworkCut >= 3)
         {
+            _factorCeiling = Math.Max(MinNetworkFactor, _networkFactor * 0.85);
+            _lastCeilingRelax = _now;
             _networkFactor = Math.Max(MinNetworkFactor, _networkFactor * 0.75);
             _lastNetworkCut = _now;
             _cleanNetworkSeconds = 0;
@@ -168,9 +177,14 @@ public sealed class AdaptiveController
         if (excessLoss < LossAboveBaselineClean && !rttCongested)
         {
             _cleanNetworkSeconds += sample.IntervalSeconds;
-            if (_cleanNetworkSeconds >= 6 && _networkFactor < 1)
+            if (_factorCeiling < 1 && _now - _lastCeilingRelax >= 60 && _now - _lastNetworkCut >= 60)
             {
-                _networkFactor = Math.Min(1, _networkFactor + 0.08);
+                _factorCeiling = Math.Min(1, _factorCeiling + 0.05);
+                _lastCeilingRelax = _now;
+            }
+            if (_cleanNetworkSeconds >= 8 && _networkFactor < _factorCeiling)
+            {
+                _networkFactor = Math.Min(_factorCeiling, _networkFactor + 0.04);
                 _cleanNetworkSeconds = 3;
                 return "network recovered";
             }

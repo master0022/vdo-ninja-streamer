@@ -314,8 +314,8 @@ public sealed class GStreamerEngine : IDisposable
                 // the WHIP session and the viewers' connection stay up.
                 _videoCaps["caps"] = VideoCaps(level);
             }
-            if (decision.NewBitrateKbps is { } kbps && _encoder is not null)
-                EncoderCatalog.SetBitrate(_encoder, entry, kbps);
+            if ((decision.NewBitrateKbps is not null || decision.NewLevel is not null) && _encoder is not null)
+                EncoderCatalog.SetBitrate(_encoder, entry, controller.BitrateKbps, controller.Current.FramesPerSecond);
             if (decision.NewLevel is not null || decision.NewBitrateKbps is not null)
             {
                 if (decision.Reason is not null)

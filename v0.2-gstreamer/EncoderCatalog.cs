@@ -110,23 +110,41 @@ internal static class EncoderCatalog
                 else
                 {
                     TrySet(encoder, "pass", "cbr");
-                    TrySet(encoder, "vbv-buf-capacity", "1000");
                 }
                 break;
         }
 
-        SetBitrate(encoder, entry, bitrateKbps);
+        SetBitrate(encoder, entry, bitrateKbps, fps);
     }
 
     /// <summary>
     /// Changes bitrate on a running encoder. NVENC, AMF, QSV and x264 all
     /// reconfigure on the fly without a new keyframe or a dropped session.
+    /// The rate-control buffer is kept at about one frame of bitrate: with the
+    /// encoder default (about a second) a keyframe can be 10x an average frame,
+    /// the packet burst overflows a home uplink or the server's queue, and
+    /// viewers freeze until the next keyframe, over and over.
     /// </summary>
-    public static void SetBitrate(Element encoder, Entry entry, int bitrateKbps)
+    public static void SetBitrate(Element encoder, Entry entry, int bitrateKbps, int fps)
     {
-        TrySet(encoder, "bitrate", Math.Max(100, bitrateKbps).ToString());
-        if (entry.Kind == EncoderKind.H264Amf)
-            TrySet(encoder, "max-bitrate", Math.Max(100, bitrateKbps * 3 / 2).ToString());
+        var kbps = Math.Max(100, bitrateKbps);
+        TrySet(encoder, "bitrate", kbps.ToString());
+        var frameKbit = Math.Max(1, kbps / Math.Max(1, fps));
+        switch (entry.Kind)
+        {
+            case EncoderKind.H264Nvenc or EncoderKind.HevcNvenc or EncoderKind.Av1Nvenc:
+                TrySet(encoder, "vbv-buffer-size", frameKbit.ToString()); // kbit
+                break;
+            case EncoderKind.H264Amf:
+                TrySet(encoder, "max-bitrate", (kbps * 3 / 2).ToString());
+                break;
+            case EncoderKind.H264MediaFoundation:
+                TrySet(encoder, "vbv-buffer-size", (frameKbit * 1000 / 8).ToString()); // bytes
+                break;
+            case EncoderKind.H264X264:
+                TrySet(encoder, "vbv-buf-capacity", Math.Max(40, 1500 / Math.Max(1, fps)).ToString()); // ms
+                break;
+        }
     }
 
     private static void TrySet(Element element, string property, string value)

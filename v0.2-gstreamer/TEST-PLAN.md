@@ -48,3 +48,14 @@ Para a validação final no PC antigo, comparar pelo menos:
 4. jogo e navegador separadamente, com Discord tocando áudio, confirmando que o arquivo/receptor contém só o PID alvo.
 
 Critério mínimo da primeira versão é não perder a sessão por sobrecarga: se a máquina não sustentar 60 FPS, reduzir FPS/bitrate de forma explícita e manter o pipeline vivo, em vez de acumular fila até stutter severo.
+
+## Medição do lado do espectador (freezes reais)
+
+`tools/viewer-probe/viewer.js` abre o Broadcast Box em um Edge headless e lê `getStats()` do WebRTC (freezeCount, totalFreezesDuration, pacotes perdidos, NACK/PLI). Uso: `npm i` na pasta, iniciar `--stream --token CHAVE_DESCARTAVEL` e rodar `HOST=servidor node viewer.js CHAVE_DESCARTAVEL 60`.
+
+Resultados que motivaram o VBV curto (4K, 9 Mbps, keyframe 1 s, mesma janela e mesmo PC):
+
+| Servidor | Antes | Depois |
+|---|---|---|
+| b.siobud.com | 2–4 freezes / 2–4 s em 40–60 s | 0 freezes |
+| tela.oisumida.rs | 13 freezes / 14,5 s em 40 s | 0–3 freezes / ≤5 s (perda aleatória do próprio servidor, também em 720p) |
