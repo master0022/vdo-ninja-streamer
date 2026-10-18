@@ -1,25 +1,50 @@
 namespace StreamerV2;
 
+/// <summary>
+/// A named set of video values. Choosing one in the UI copies every field
+/// into the editable settings; the stream then uses exactly those values.
+/// </summary>
+public sealed record VideoPreset(
+    string Name,
+    int Width,
+    int Height,
+    int FramesPerSecond,
+    int VideoBitrateKbps,
+    ScaleMethod Scale,
+    RateControl RateControl,
+    int KeyframeIntervalSeconds,
+    string EncoderPreset,
+    int BFrames);
+
 public static class Presets
 {
     private const string Endpoint = "https://b.siobud.com/api/whip";
 
-    public static readonly StreamSettings StableOldPc = new(
-        EncoderKind.H264Nvenc, 1280, 720, 30, 2_000, 192, 2.0,
-        ScaleMethod.Bilinear, RateControl.Cbr, 1, "low-latency", 0,
+    public static readonly StreamSettings Defaults = new(
+        EncoderKind.Auto, 1280, 720, 30, 2_500, 192, 2.0,
+        ScaleMethod.Bilinear, RateControl.Cbr, 1, "p1", 0,
         true, true, true, NetworkDegradation.PreserveFramerate, Endpoint,
         "", 23, VideoSourceKind.Window, -1, AudioSourceKind.SelectedProcess)
     {
-        Encoder = EncoderKind.Auto,
         SettingsVersion = CurrentSettingsVersion
     };
 
     public const int CurrentSettingsVersion = 3;
 
+    // Encoder presets use NVENC names; x264 falls back to ultrafast for
+    // names it does not know, and AMF/QSV/Media Foundation ignore them.
+    public static readonly VideoPreset[] Video =
+    [
+        new("720p30 · light / older PCs", 1280, 720, 30, 2_500, ScaleMethod.Bilinear, RateControl.Cbr, 1, "p1", 0),
+        new("720p60 · games", 1280, 720, 60, 4_000, ScaleMethod.Bilinear, RateControl.Cbr, 1, "p1", 0),
+        new("1080p30 · screen and text", 1920, 1080, 30, 4_500, ScaleMethod.Bilinear, RateControl.Cbr, 1, "p4", 0),
+        new("1080p60 · 4K source, Lanczos", 1920, 1080, 60, 8_000, ScaleMethod.Lanczos, RateControl.Cbr, 1, "p4", 0),
+        new("4K30 · native", 3840, 2160, 30, 12_000, ScaleMethod.None, RateControl.Cbr, 1, "p4", 0),
+    ];
+
     /// <summary>
-    /// v3 moved everyone to automatic quality: earlier builds asked people to
-    /// tune encoder/bitrate by hand and almost nobody picked values that fit
-    /// their PC. The stream key, endpoint, source and audio choices are kept.
+    /// v3 reset the encoder to automatic selection: earlier builds asked people
+    /// to pick one by hand and many picked one their PC did not have.
     /// </summary>
     public static StreamSettings Migrate(StreamSettings loaded) =>
         loaded.SettingsVersion >= CurrentSettingsVersion
@@ -27,20 +52,6 @@ public static class Presets
             : loaded with
             {
                 Encoder = EncoderKind.Auto,
-                AutoQuality = true,
-                Mode = StreamMode.Performance720,
                 SettingsVersion = CurrentSettingsVersion
             };
-
-    public static readonly StreamSettings Motion60 = StableOldPc with
-    {
-        FramesPerSecond = 60,
-        VideoBitrateKbps = 3_500
-    };
-
-    public static readonly StreamSettings FourKDownscale = Motion60 with
-    {
-        Scale = ScaleMethod.Lanczos,
-        VideoBitrateKbps = 5_000
-    };
 }

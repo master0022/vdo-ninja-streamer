@@ -3,8 +3,8 @@ using Gst;
 namespace StreamerV2;
 
 /// <summary>
-/// Every video encoder the app can drive, in the order automatic mode tries
-/// them. GStreamer only registers a hardware factory when the matching GPU and
+/// Every video encoder the app can drive, in the order automatic encoder
+/// selection tries them. GStreamer only registers a hardware factory when the matching GPU and
 /// driver exist, so "factory present" is already a hardware probe; a factory
 /// that is present but fails to open (old driver, session limit) is skipped at
 /// stream start by the engine's fallback.
@@ -60,9 +60,8 @@ internal static class EncoderCatalog
         {
             case EncoderKind.H264Nvenc or EncoderKind.HevcNvenc or EncoderKind.Av1Nvenc:
                 TrySet(encoder, "rc-mode", NvencRateControl(settings.RateControl));
-                // p1 + ultra-low-latency is the lightest NVENC configuration;
-                // the manual preset only applies when auto quality is off.
-                TrySet(encoder, "preset", settings.AutoQuality || string.IsNullOrWhiteSpace(settings.EncoderPreset)
+                // p1 + ultra-low-latency is the lightest NVENC configuration.
+                TrySet(encoder, "preset", string.IsNullOrWhiteSpace(settings.EncoderPreset)
                     ? "p1"
                     : settings.EncoderPreset.ToLowerInvariant());
                 TrySet(encoder, "tune", "ultra-low-latency");
@@ -94,7 +93,7 @@ internal static class EncoderCatalog
                 TrySet(encoder, "gop-size", gop);
                 break;
             case EncoderKind.H264X264:
-                TrySet(encoder, "speed-preset", settings.AutoQuality ? "ultrafast" : X264Preset(settings.EncoderPreset));
+                TrySet(encoder, "speed-preset", X264Preset(settings.EncoderPreset));
                 TrySet(encoder, "tune", "zerolatency");
                 TrySet(encoder, "bframes", bFrames);
                 TrySet(encoder, "key-int-max", gop);
@@ -102,7 +101,7 @@ internal static class EncoderCatalog
                 TrySet(encoder, "sync-lookahead", "0");
                 TrySet(encoder, "sliced-threads", "true");
                 TrySet(encoder, "threads", Math.Clamp(Environment.ProcessorCount, 1, 8).ToString());
-                if (settings.RateControl == RateControl.Crf && !settings.AutoQuality)
+                if (settings.RateControl == RateControl.Crf)
                 {
                     TrySet(encoder, "pass", "quant");
                     TrySet(encoder, "quantizer", Math.Clamp(settings.Crf, 0, 50).ToString());

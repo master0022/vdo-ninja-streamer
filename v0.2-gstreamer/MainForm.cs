@@ -42,7 +42,7 @@ internal sealed class MainForm : Form
         Icon = LoadApplicationIcon();
         BackColor = Color.FromArgb(12, 15, 22);
 
-        _settings = Presets.Migrate(_settingsStore.LoadOrDefault(Presets.StableOldPc));
+        _settings = Presets.Migrate(_settingsStore.LoadOrDefault(Presets.Defaults));
         _webView.Dock = DockStyle.Fill;
         _webView.DefaultBackgroundColor = BackColor;
         Controls.Add(_webView);
@@ -382,7 +382,7 @@ internal sealed class MainForm : Form
             Clamp(value, "keyframeSeconds", _settings.KeyframeIntervalSeconds, 1, 10),
             String(value, "encoderPreset", _settings.EncoderPreset).Trim(),
             Clamp(value, "bFrames", _settings.BFrames, 0, 4),
-            _settings.AdaptiveNetwork,
+            Bool(value, "adaptiveBitrate", _settings.AdaptiveNetwork),
             _settings.ForwardErrorCorrection,
             _settings.Retransmission,
             _settings.Degradation,
@@ -392,11 +392,7 @@ internal sealed class MainForm : Form
             videoSource,
             Clamp(value, "monitorIndex", _settings.MonitorIndex, -1, 32),
             audioSource,
-            Presets.CurrentSettingsVersion,
-            EnumValue(value, "mode", _settings.Mode),
-            value.TryGetProperty("autoQuality", out var auto) && auto.ValueKind is JsonValueKind.True or JsonValueKind.False
-                ? auto.GetBoolean()
-                : _settings.AutoQuality);
+            Presets.CurrentSettingsVersion);
     }
 
     private void SendState()
@@ -438,9 +434,21 @@ internal sealed class MainForm : Form
                 videoSource = _settings.VideoSource.ToString(),
                 monitorIndex = _settings.MonitorIndex,
                 audioSource = _settings.AudioSource.ToString(),
-                mode = _settings.Mode.ToString(),
-                autoQuality = _settings.AutoQuality
-            }
+                adaptiveBitrate = _settings.AdaptiveNetwork
+            },
+            presets = Presets.Video.Select(p => new
+            {
+                name = p.Name,
+                width = p.Width,
+                height = p.Height,
+                fps = p.FramesPerSecond,
+                videoKbps = p.VideoBitrateKbps,
+                scale = p.Scale.ToString(),
+                rateControl = p.RateControl.ToString(),
+                keyframeSeconds = p.KeyframeIntervalSeconds,
+                encoderPreset = p.EncoderPreset,
+                bFrames = p.BFrames
+            }).ToArray()
         };
         _core.PostWebMessageAsJson(JsonSerializer.Serialize(state, _json));
     }
@@ -509,6 +517,9 @@ internal sealed class MainForm : Form
 
     private static int Clamp(JsonElement value, string name, int fallback, int minimum, int maximum) =>
         value.TryGetProperty(name, out var property) && property.TryGetInt32(out var parsed) ? Math.Clamp(parsed, minimum, maximum) : Math.Clamp(fallback, minimum, maximum);
+
+    private static bool Bool(JsonElement value, string name, bool fallback) =>
+        value.TryGetProperty(name, out var property) && property.ValueKind is JsonValueKind.True or JsonValueKind.False ? property.GetBoolean() : fallback;
 
     private static double Double(JsonElement value, string name, double fallback) =>
         value.TryGetProperty(name, out var property) && property.TryGetDouble(out var parsed) ? parsed : fallback;

@@ -47,31 +47,28 @@ if (arguments.Contains("--list-monitors", StringComparer.OrdinalIgnoreCase))
 }
 
 var duration = TimeSpan.FromSeconds(GetInt(arguments, "--duration", 30));
-var settings = Presets.StableOldPc with
+var settings = Presets.Defaults with
 {
-    Encoder = GetEnum(arguments, "--encoder", Presets.StableOldPc.Encoder),
-    RateControl = GetEnum(arguments, "--rate-control", Presets.StableOldPc.RateControl),
-    Scale = GetEnum(arguments, "--scale", Presets.StableOldPc.Scale),
-    WhipEndpoint = GetString(arguments, "--endpoint", Presets.StableOldPc.WhipEndpoint),
+    Encoder = GetEnum(arguments, "--encoder", Presets.Defaults.Encoder),
+    RateControl = GetEnum(arguments, "--rate-control", Presets.Defaults.RateControl),
+    Scale = GetEnum(arguments, "--scale", Presets.Defaults.Scale),
+    WhipEndpoint = GetString(arguments, "--endpoint", Presets.Defaults.WhipEndpoint),
     BearerToken = GetString(arguments, "--token", ""),
-    Width = GetInt(arguments, "--width", Presets.StableOldPc.Width),
-    Height = GetInt(arguments, "--height", Presets.StableOldPc.Height),
-    FramesPerSecond = GetInt(arguments, "--fps", Presets.StableOldPc.FramesPerSecond),
-    VideoBitrateKbps = GetInt(arguments, "--video-kbps", Presets.StableOldPc.VideoBitrateKbps),
-    AudioBitrateKbps = GetInt(arguments, "--audio-kbps", Presets.StableOldPc.AudioBitrateKbps),
-    AudioGain = GetDouble(arguments, "--audio-gain", Presets.StableOldPc.AudioGain),
-    EncoderPreset = GetString(arguments, "--preset", GetString(arguments, "--nvenc-preset", Presets.StableOldPc.EncoderPreset)),
-    KeyframeIntervalSeconds = GetInt(arguments, "--keyframe", Presets.StableOldPc.KeyframeIntervalSeconds),
-    BFrames = GetInt(arguments, "--bframes", Presets.StableOldPc.BFrames),
-    Crf = GetInt(arguments, "--crf", Presets.StableOldPc.Crf),
-    VideoSource = GetEnum(arguments, "--video-source", Presets.StableOldPc.VideoSource),
-    MonitorIndex = GetInt(arguments, "--monitor-index", Presets.StableOldPc.MonitorIndex),
+    Width = GetInt(arguments, "--width", Presets.Defaults.Width),
+    Height = GetInt(arguments, "--height", Presets.Defaults.Height),
+    FramesPerSecond = GetInt(arguments, "--fps", Presets.Defaults.FramesPerSecond),
+    VideoBitrateKbps = GetInt(arguments, "--video-kbps", Presets.Defaults.VideoBitrateKbps),
+    AudioBitrateKbps = GetInt(arguments, "--audio-kbps", Presets.Defaults.AudioBitrateKbps),
+    AudioGain = GetDouble(arguments, "--audio-gain", Presets.Defaults.AudioGain),
+    EncoderPreset = GetString(arguments, "--preset", GetString(arguments, "--nvenc-preset", Presets.Defaults.EncoderPreset)),
+    KeyframeIntervalSeconds = GetInt(arguments, "--keyframe", Presets.Defaults.KeyframeIntervalSeconds),
+    BFrames = GetInt(arguments, "--bframes", Presets.Defaults.BFrames),
+    Crf = GetInt(arguments, "--crf", Presets.Defaults.Crf),
+    VideoSource = GetEnum(arguments, "--video-source", Presets.Defaults.VideoSource),
+    MonitorIndex = GetInt(arguments, "--monitor-index", Presets.Defaults.MonitorIndex),
     AudioSource = GetEnum(arguments, "--audio-source",
-        GetEnum(arguments, "--audio-mode", Presets.StableOldPc.AudioSource)),
-    Mode = GetEnum(arguments, "--mode", Presets.StableOldPc.Mode),
-    // Explicit --width/--height/--video-kbps imply manual quality unless overridden.
-    AutoQuality = GetBool(arguments, "--auto-quality",
-        GetOptionalString(arguments, "--width") is null && GetOptionalString(arguments, "--video-kbps") is null)
+        GetEnum(arguments, "--audio-mode", Presets.Defaults.AudioSource)),
+    AdaptiveNetwork = GetBool(arguments, "--adaptive-bitrate", Presets.Defaults.AdaptiveNetwork)
 };
 
 var target = ResolveTarget(arguments, settings);

@@ -13,14 +13,6 @@ public enum EncoderKind
     Auto
 }
 
-public enum StreamMode
-{
-    // Fixed 1280x720 ceiling: the light choice for older PCs and games.
-    Performance720,
-    // Up to the source's native resolution (max 4K) for sharp text/screens.
-    Sharp
-}
-
 public sealed record EncoderOption(
     EncoderKind Value,
     string Label,
@@ -65,11 +57,7 @@ public sealed record StreamSettings(
     VideoSourceKind VideoSource = VideoSourceKind.Window,
     int MonitorIndex = -1,
     AudioSourceKind AudioSource = AudioSourceKind.SelectedProcess,
-    int SettingsVersion = 2,
-    StreamMode Mode = StreamMode.Performance720,
-    // When true the app picks encoder, resolution, FPS and bitrate itself and
-    // keeps adjusting them; the manual fields only apply when this is false.
-    bool AutoQuality = true);
+    int SettingsVersion = 2);
 
 /// <summary>What the stream is actually sending right now.</summary>
 public sealed record LiveStreamInfo(

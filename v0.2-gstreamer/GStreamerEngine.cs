@@ -130,19 +130,15 @@ public sealed class GStreamerEngine : IDisposable
         if (candidates.Count == 0)
             return new(false, false, TimeSpan.Zero, "No usable H.264 encoder was found on this PC.", 0, "");
 
-        var (sourceWidth, sourceHeight) = WindowDiscovery.GetSourceSize(target);
-        var levels = settings.AutoQuality
-            ? AdaptiveController.BuildLadder(settings.Mode, sourceWidth, sourceHeight)
-            : [new QualityLevel(settings.Width, settings.Height, settings.FramesPerSecond, settings.VideoBitrateKbps)];
-
         long busMessages = 0;
         string? lastError = null;
         string description = "";
         var everStarted = false;
         var candidateIndex = 0;
         var reconnects = 0;
-        var retriedBelow4K = false;
-        AdaptiveController? controller = null;
+        // Shared by every session so a reconnect or encoder switch keeps what
+        // was learned about this connection.
+        var bitrate = new BitrateController(settings.VideoBitrateKbps, settings.AdaptiveNetwork);
 
         while (!cancellationToken.IsCancellationRequested && System.DateTime.UtcNow < deadline && candidateIndex < candidates.Count)
         {
@@ -155,13 +151,9 @@ public sealed class GStreamerEngine : IDisposable
                 continue;
             }
 
-            // A new encoder starts from its own safe level; a reconnect keeps
-            // whatever the controller had learned about this PC and network.
-            controller ??= new AdaptiveController(levels, AdaptiveController.StartIndex(levels, entry.IsHardware), settings.AutoQuality);
-
-            var session = new Session(target, settings, entry, factory, outputPath, controller, observer);
+            var session = new Session(target, settings, entry, factory, outputPath, bitrate, observer);
             description = session.Description;
-            observer.OnLog?.Invoke($"Starting {entry.Label} at {controller.Current.Width}x{controller.Current.Height}@{controller.Current.FramesPerSecond}, {controller.BitrateKbps} kbps.");
+            observer.OnLog?.Invoke($"Starting {entry.Label} at {settings.Width}x{settings.Height}@{settings.FramesPerSecond}, {bitrate.BitrateKbps} kbps.");
             var outcome = session.Run(this, deadline, cancellationToken, metrics);
             busMessages += outcome.BusMessages;
             everStarted |= outcome.ProducedFrames;
@@ -172,21 +164,8 @@ public sealed class GStreamerEngine : IDisposable
 
             if (!outcome.ProducedFrames)
             {
-                // Older GPUs cap encoder resolution; retry once at 1080p before
-                // giving up on a hardware encoder that would otherwise work.
-                if (!retriedBelow4K && controller.Current.Height > 1080 && levels.Any(l => l.Height <= 1080))
-                {
-                    retriedBelow4K = true;
-                    observer.OnLog?.Invoke($"{entry.Label} could not start above 1080p; retrying at 1080p.");
-                    // Drop the higher steps too, so auto quality never climbs back into them.
-                    levels = levels.Where(l => l.Height <= 1080).ToArray();
-                    controller = new AdaptiveController(levels, 0, settings.AutoQuality);
-                    continue;
-                }
-                retriedBelow4K = false;
                 observer.OnLog?.Invoke($"{entry.Label} could not start: {outcome.Error}");
                 candidateIndex++;
-                controller = null;
                 if (candidateIndex < candidates.Count)
                     observer.OnLog?.Invoke($"Trying the next encoder: {candidates[candidateIndex].Label}.");
                 continue;
@@ -215,12 +194,10 @@ public sealed class GStreamerEngine : IDisposable
         EncoderCatalog.Entry entry,
         string factory,
         string? outputPath,
-        AdaptiveController controller,
+        BitrateController bitrate,
         StreamObserver observer)
     {
         private Element? _encoder;
-        private Element? _videoCaps;
-        private bool _systemMemory;
         private long _encodedFrames;
         // Held in a field: the native side keeps calling it for every frame.
         private PadProbeCallback? _countFrames;
@@ -239,7 +216,7 @@ public sealed class GStreamerEngine : IDisposable
 
             try
             {
-                engine._pipeline = Build(controller.Current, controller.BitrateKbps);
+                engine._pipeline = Build(bitrate.BitrateKbps);
                 if (engine._pipeline.SetState(State.Playing) == StateChangeReturn.Failure)
                     return new(false, TimeSpan.Zero, "GStreamer refused to start the pipeline.", false, 0);
                 Report(null);
@@ -261,10 +238,8 @@ public sealed class GStreamerEngine : IDisposable
                     {
                         metrics.Sample();
                         var (loss, rtt) = outputPath is null ? network.Read(engine._pipeline) : (null, null);
-                        var sample = new AdaptiveSample(interval, frames - framesAtLastTick, cpu.Sample(), loss, rtt);
-                        observer.OnTrace?.Invoke($"encoded {sample.FramesEncoded / interval:0.0} fps, system CPU {sample.SystemCpuPercent:0}%, loss {(loss is null ? "n/a" : loss.Value.ToString("P1"))}, RTT {(rtt is null ? "n/a" : rtt.Value.ToString("0") + " ms")}");
-                        var decision = controller.Tick(sample);
-                        Apply(decision);
+                        observer.OnTrace?.Invoke($"encoded {(frames - framesAtLastTick) / interval:0.0} fps, system CPU {cpu.Sample():0}%, loss {(loss is null ? "n/a" : loss.Value.ToString("P1"))}, RTT {(rtt is null ? "n/a" : rtt.Value.ToString("0") + " ms")}");
+                        Apply(bitrate.Tick(new NetworkSample(interval, loss, rtt)));
                         lastTick = now;
                         framesAtLastTick = frames;
                     }
@@ -306,34 +281,20 @@ public sealed class GStreamerEngine : IDisposable
             }
         }
 
-        private void Apply(AdaptiveDecision decision)
+        private void Apply(BitrateDecision decision)
         {
-            if (decision.NewLevel is { } level && _videoCaps is not null)
-            {
-                // Changing the caps renegotiates scaler and encoder in place;
-                // the WHIP session and the viewers' connection stay up.
-                _videoCaps["caps"] = VideoCaps(level);
-            }
-            if ((decision.NewBitrateKbps is not null || decision.NewLevel is not null) && _encoder is not null)
-                EncoderCatalog.SetBitrate(_encoder, entry, controller.BitrateKbps, controller.Current.FramesPerSecond);
-            if (decision.NewLevel is not null || decision.NewBitrateKbps is not null)
-            {
-                if (decision.Reason is not null)
-                    observer.OnLog?.Invoke($"Auto quality: {(decision.NewLevel is not null ? $"{controller.Current.Width}x{controller.Current.Height}@{controller.Current.FramesPerSecond}, " : "")}{controller.BitrateKbps} kbps — {decision.Reason}.");
-                Report(decision.Reason);
-            }
+            if (decision.NewBitrateKbps is not { } kbps) return;
+            if (_encoder is not null)
+                EncoderCatalog.SetBitrate(_encoder, entry, kbps, settings.FramesPerSecond);
+            if (decision.Reason is not null)
+                observer.OnLog?.Invoke($"Bitrate: {kbps} of {settings.VideoBitrateKbps} kbps — {decision.Reason}.");
+            Report(decision.Reason);
         }
 
-        private void Report(string? reason)
-        {
-            var level = controller.Current;
-            observer.OnInfo?.Invoke(new LiveStreamInfo(entry.Label, level.Width, level.Height, level.FramesPerSecond, controller.BitrateKbps, reason));
-        }
+        private void Report(string? reason) =>
+            observer.OnInfo?.Invoke(new LiveStreamInfo(entry.Label, settings.Width, settings.Height, settings.FramesPerSecond, bitrate.BitrateKbps, reason));
 
-        private Caps VideoCaps(QualityLevel level) => Caps.FromString(
-            $"video/x-raw{(_systemMemory ? "" : "(memory:D3D11Memory)")},format=NV12,width={level.Width},height={level.Height},framerate={level.FramesPerSecond}/1");
-
-        private Pipeline Build(QualityLevel level, int bitrateKbps)
+        private Pipeline Build(int bitrateKbps)
         {
             var pipeline = new Pipeline("streamer-v02");
             var screen = Make("d3d11screencapturesrc", "screen", pipeline);
@@ -353,25 +314,25 @@ public sealed class GStreamerEngine : IDisposable
             var video = new List<Element> { screen, convert };
             // Lanczos/Bicubic exist only as CPU filters; everything else keeps
             // frames on the GPU from capture to encoder with no copies.
-            _systemMemory = !entry.AcceptsD3D11 ||
-                            (!settings.AutoQuality && settings.Scale is ScaleMethod.Bicubic or ScaleMethod.Lanczos);
-            if (_systemMemory)
+            var systemMemory = !entry.AcceptsD3D11 || settings.Scale is ScaleMethod.Bicubic or ScaleMethod.Lanczos;
+            if (systemMemory)
             {
                 var download = Make("d3d11download", "gpu-download", pipeline);
                 var cpuConvert = Make("videoconvert", "cpu-convert", pipeline);
                 var scale = Make("videoscale", "cpu-scale", pipeline);
-                Set(scale, "method", settings.AutoQuality ? 1 : VideoScaleMethod(settings.Scale));
+                Set(scale, "method", VideoScaleMethod(settings.Scale));
                 Set(scale, "n-threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 4));
                 Set(cpuConvert, "n-threads", (uint)Math.Clamp(Environment.ProcessorCount, 1, 4));
                 video.AddRange([download, cpuConvert, scale]);
             }
             else
             {
-                Set(convert, "method", settings.Scale == ScaleMethod.None && !settings.AutoQuality ? 0 : 1);
+                Set(convert, "method", settings.Scale == ScaleMethod.None ? 0 : 1);
             }
-            _videoCaps = Make("capsfilter", "video-caps", pipeline);
-            _videoCaps["caps"] = VideoCaps(level);
-            video.Add(_videoCaps);
+            var videoCaps = Make("capsfilter", "video-caps", pipeline);
+            videoCaps["caps"] = Caps.FromString(
+                $"video/x-raw{(systemMemory ? "" : "(memory:D3D11Memory)")},format=NV12,width={settings.Width},height={settings.Height},framerate={settings.FramesPerSecond}/1");
+            video.Add(videoCaps);
 
             var queue = Make("queue", "video-queue", pipeline);
             Set(queue, "max-size-buffers", (uint)2);
@@ -381,7 +342,7 @@ public sealed class GStreamerEngine : IDisposable
             video.Add(queue);
 
             _encoder = Make(factory, "encoder", pipeline);
-            EncoderCatalog.Configure(_encoder, entry, settings, bitrateKbps, level.FramesPerSecond);
+            EncoderCatalog.Configure(_encoder, entry, settings, bitrateKbps, settings.FramesPerSecond);
             _countFrames = (_, _) =>
             {
                 Interlocked.Increment(ref _encodedFrames);

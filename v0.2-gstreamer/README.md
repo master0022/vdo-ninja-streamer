@@ -5,8 +5,8 @@ Implementação isolada da próxima versão do streamer. A versão existente em 
 ## Rodar
 
 - Execute `StreamerV2.exe` sem argumentos para abrir a UI HTML escura hospedada pelo WebView2.
-- A UI é English-only. A tela principal tem só o essencial: o que compartilhar (janela ou monitor), a qualidade (`Sharp screen` até 4K ou `Performance` 720p), o link e `Start`/`Stop`. Encoder, valores manuais, áudio, endpoint, teste local e log ficam em `Advanced`.
-- Por padrão a qualidade é automática: o app escolhe o encoder, a resolução, o FPS e o bitrate e continua ajustando durante a transmissão (ver "Qualidade automática"). Configurações salvas por versões antigas migram para o modo automático; a stream key, o endpoint, a fonte e o áudio são mantidos.
+- A UI é English-only. A tela principal tem o que compartilhar (janela ou monitor), a qualidade (preset, resolução, FPS, bitrate, scaling e encoder), o link e `Start`/`Stop`. Ajustes finos do encoder, áudio, endpoint, teste local e log ficam em `Advanced`.
+- A stream usa exatamente a resolução, o FPS, o scaling e o encoder escolhidos (ver "Qualidade"). Só o bitrate pode baixar sozinho, e só por perda de pacotes na rede.
 - O áudio da janela é sempre isolado pelo processo escolhido; somente o modo de monitor inteiro usa o áudio global com Discord excluído. O ganho aparece como percentual na UI: 100% é normal e 200% é o padrão.
 - A stream key fica salva localmente em `settings-v02.json`; a UI mostra o viewer link clicável, oferece `Copy link` e só libera a troca da key pelo botão `Change stream key`.
 - A stream só existe enquanto o processo do app mantém o pipeline GStreamer vivo. Ao fechar o app, a UI cancela e aguarda o pipeline chegar a `NULL` antes de sair.
@@ -36,16 +36,16 @@ StreamerV2.exe --capture --monitor-index 0 --audio-mode SystemExceptDiscord --du
 StreamerV2.exe --stream --title YouTube --token STREAM_KEY --duration 30
 ```
 
-No modo CLI, `--stream` e `--capture` imprimem a cada segundo uma linha `[trace]` com FPS codificado, CPU do sistema e perda, além de cada ajuste automático. `--mode Sharp|Performance720` escolhe o modo; `--auto-quality false` (ou passar `--width`/`--video-kbps`) usa valores fixos. Opções de teste incluem `--encoder Auto|H264Nvenc|H264Amf|H264QuickSync|H264MediaFoundation|H264X264|HevcNvenc|Av1Nvenc`, `--rate-control Cbr|Vbr|Cqp|Crf`, `--scale None|Bilinear|Bicubic|Lanczos`, `--preset`, `--crf`, `--width`, `--height`, `--fps`, `--video-kbps`, `--audio-kbps`, `--audio-gain`, `--video-source Window|Monitor`, `--monitor-index`, `--audio-mode SelectedProcess|SystemExceptDiscord` e `--audio-source`.
+No modo CLI, `--stream` e `--capture` imprimem a cada segundo uma linha `[trace]` com FPS codificado, CPU do sistema e perda, além de cada ajuste de bitrate. `--adaptive-bitrate false` mantém o bitrate fixo. Opções de teste incluem `--encoder Auto|H264Nvenc|H264Amf|H264QuickSync|H264MediaFoundation|H264X264|HevcNvenc|Av1Nvenc`, `--rate-control Cbr|Vbr|Cqp|Crf`, `--scale None|Bilinear|Bicubic|Lanczos`, `--preset`, `--crf`, `--width`, `--height`, `--fps`, `--video-kbps`, `--audio-kbps`, `--audio-gain`, `--video-source Window|Monitor`, `--monitor-index`, `--audio-mode SelectedProcess|SystemExceptDiscord` e `--audio-source`.
 
 ## Pipeline efetivo
 
 ```text
 Window/monitor -> d3d11screencapturesrc (WGC)
-     -> d3d11convert -> capsfilter (resolução/FPS do degrau atual, D3D11Memory)
+     -> d3d11convert -> capsfilter (resolução/FPS escolhidos, D3D11Memory)
      -> queue (2 frames, descarta frames inteiros se o encoder atrasar)
      -> NVENC / AMF / QSV / Media Foundation (sem cópia para a CPU)
-        ou d3d11download/videoconvert/videoscale -> x264
+        ou d3d11download/videoconvert/videoscale -> x264 (ou qualquer encoder com scaling Bicubic/Lanczos)
      -> h264parse -> rtph264pay -> queue (300 ms) -> whipsink
 
 Selected window -> wasapi2src (process loopback, include-process-tree)
@@ -54,20 +54,17 @@ Entire monitor -> wasapi2src (system loopback, exclude-process-tree com Discord 
     -> Opus -> rtpopuspay -> queue (300 ms) -> whipsink
 ```
 
-## Qualidade automática
+## Qualidade
 
-Encoder: em `Automatic`, o app tenta H.264 nesta ordem e fica com o primeiro que produzir vídeo: NVIDIA NVENC (`nvd3d11h264enc`) → AMD AMF (`amfh264enc`) → Intel Quick Sync (`qsvh264enc`) → Windows Media Foundation (`mfh264enc`) → x264 (CPU). O GStreamer só registra um encoder de hardware quando a GPU e o driver existem; se um deles abre mas não gera frames em 8 s (driver antigo, limite de sessões), o próximo é usado. Se um encoder de hardware falha acima de 1080p, ele é tentado de novo em 1080p antes do fallback. HEVC e AV1 só são usados quando escolhidos manualmente, porque nem todo navegador decodifica.
+Presets: escolher um preset preenche todos os campos de vídeo (resolução, FPS, bitrate, scaling, rate control, keyframe, preset do encoder, B-frames). Editar qualquer campo depois muda o seletor para `Custom`. Os presets ficam em `Presets.cs` (`Presets.Video`); o de 4K → 1080p60 usa Lanczos.
 
-Escada de qualidade: `Sharp` começa na resolução nativa da fonte (até 3840×2160, bitrate até 9 Mbps); `Performance` começa em 720p30 (~2,2 Mbps). Os degraus mantêm a proporção da janela, nunca aumentam a resolução e descem até 360p20. Com x264, o início é 720p (540p em CPUs de até 4 threads).
+Scaling: `None` e `Bilinear` ficam na GPU. `Bicubic` e `Lanczos` só existem como filtro de CPU (`videoscale`), então o frame é baixado da GPU na resolução da fonte e escalado na CPU antes do encoder.
 
-Controle (`AdaptiveController.cs`), avaliado a cada segundo:
+Encoder: em `Automatic`, o app usa o melhor H.264 disponível nesta ordem e fica com o primeiro que produzir vídeo: NVIDIA NVENC (`nvd3d11h264enc`) → AMD AMF (`amfh264enc`) → Intel Quick Sync (`qsvh264enc`) → Windows Media Foundation (`mfh264enc`) → x264 (CPU). Se um deles abre mas não gera frames em 8 s (driver antigo, limite de sessões), o próximo é usado, sempre com a mesma resolução e FPS. HEVC e AV1 só são usados quando escolhidos manualmente, porque nem todo navegador decodifica.
 
-- Processamento: se o encoder fica abaixo de 85% do FPS alvo ou a CPU do sistema passa de 92% por 3 s, desce um degrau (resolução/FPS). A mudança renegocia os caps com o pipeline rodando; a sessão WHIP e os espectadores não caem.
-- Rede: a perda é calculada pelos contadores RTCP (pacotes perdidos ÷ pacotes enviados desde a última leitura) e comparada com a base da própria conexão. Perda acima da base reduz o bitrate; congestionamento sustentado também reduz a resolução. O Broadcast Box não preenche os campos de RTT, então o RTT só é usado quando vem diferente de zero.
-- Subida: após 25 s sem pressão, sobe um degrau. Um degrau que falha logo depois de subir não é tentado de novo por 5 minutos.
-- Queda da conexão: reconecta automaticamente com espera crescente (até 8 tentativas seguidas).
+Bitrate (`BitrateController.cs`, opção `Lower bitrate when the network drops packets`), avaliado a cada segundo: a perda é calculada pelos contadores RTCP (pacotes perdidos ÷ pacotes enviados desde a última leitura) e comparada com a base da própria conexão. Perda acima da base reduz o bitrate (até 35% do valor escolhido); com a rede limpa ele sobe devagar de volta, nunca acima do valor escolhido. Resolução, FPS e encoder nunca mudam durante a transmissão. O Broadcast Box não preenche os campos de RTT, então o RTT só é usado quando vem diferente de zero.
 
-Desligar `Automatic quality` em `Advanced` volta ao comportamento manual (largura, altura, FPS, bitrate, preset, CRF e scaling fixos).
+Queda da conexão: reconecta automaticamente com espera crescente (até 8 tentativas seguidas).
 
 ## Transporte
 
