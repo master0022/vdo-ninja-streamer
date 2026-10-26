@@ -22,6 +22,9 @@ if (args.Length == 0)
     return 0;
 }
 
+if (args.Contains("--serve", StringComparer.OrdinalIgnoreCase))
+    return ServeMode.Run();
+
 GStreamerEngine.Initialize();
 
 var arguments = args.ToList();

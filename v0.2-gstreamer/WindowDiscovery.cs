@@ -87,6 +87,18 @@ public static class WindowDiscovery
         }
     }
 
+    /// <summary>Builds a target for a window chosen elsewhere (e.g. a Discord source picker).</summary>
+    public static WindowTarget? FromHwnd(nint hwnd)
+    {
+        if (!IsWindow(hwnd)) return null;
+        GetWindowThreadProcessId(hwnd, out var pid);
+        if (pid == 0) return null;
+        string processName;
+        try { processName = Process.GetProcessById((int)pid).ProcessName; }
+        catch { return null; }
+        return new WindowTarget(hwnd, (int)pid, GetWindowText(hwnd), processName, GetClassName(hwnd));
+    }
+
     public static bool IsAlive(WindowTarget target) =>
         target.SourceKind == VideoSourceKind.Monitor
             ? target.MonitorIndex >= 0 && target.MonitorIndex < Screen.AllScreens.Length
