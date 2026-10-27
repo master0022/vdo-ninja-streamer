@@ -13,6 +13,7 @@ namespace StreamerV2;
 ///   in : {"cmd":"status"} | {"cmd":"monitors"}
 ///        {"cmd":"start","hwnd":"0x1234"} or {"cmd":"start","monitorIndex":0}
 ///          optional: "width","height","fps","kbps" override the saved settings
+///          optional: "excludePid" = the Discord process whose audio a monitor capture leaves out
 ///        {"cmd":"stop"}
 ///   out: {"event":"ready"}, {"event":"status",...}, {"event":"monitors",...}
 ///        {"event":"starting"}, {"event":"live",...}, {"event":"log","text":...}
@@ -104,6 +105,7 @@ public static class ServeMode
     private static void Start(JsonObject message)
     {
         Stop();
+        WindowDiscovery.DiscordPidOverride = (int?)message["excludePid"];
 
         var settings = LoadSettings();
         if (string.IsNullOrWhiteSpace(settings.BearerToken))

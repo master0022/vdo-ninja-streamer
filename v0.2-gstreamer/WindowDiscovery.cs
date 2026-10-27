@@ -104,8 +104,28 @@ public static class WindowDiscovery
             ? target.MonitorIndex >= 0 && target.MonitorIndex < Screen.AllScreens.Length
             : IsWindow(target.Hwnd) && !IsIconic(target.Hwnd);
 
+    /// <summary>
+    /// The Discord process to leave out of system audio, when the caller knows it (serve mode gets it
+    /// from the Discord plugin). Guessing by name can pick the wrong Discord, letting voice chat and
+    /// in-Discord players leak into the stream and feed back.
+    /// </summary>
+    public static int? DiscordPidOverride { get; set; }
+
     public static int? FindDiscordRootPid()
     {
+        if (DiscordPidOverride is { } known)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(known);
+                if (!process.HasExited) return known;
+            }
+            catch
+            {
+                // Gone; fall back to looking it up.
+            }
+        }
+
         var candidates = new List<(int Pid, DateTime Started)>();
         foreach (var process in Process.GetProcesses())
         {
