@@ -14,14 +14,16 @@ namespace StreamerV2;
 ///        {"cmd":"start","hwnd":"0x1234"} or {"cmd":"start","monitorIndex":0}
 ///          optional: "width","height","fps","kbps" override the saved settings
 ///          optional: "excludePid" = the Discord process whose audio a monitor capture leaves out
+///          optional: "endpoint" (WHIP URL) and "streamKey" override the saved ones
 ///        {"cmd":"stop"}
 ///   out: {"event":"ready"}, {"event":"status",...}, {"event":"monitors",...}
 ///        {"event":"starting"}, {"event":"live",...}, {"event":"log","text":...}
 ///        {"event":"ended","completed":bool,"error":string?}, {"event":"error","text":...}
 ///
 /// Settings and the stream key come from settings-v02.json next to the exe, the
-/// same file the normal UI saves. Closing stdin (the parent exiting) stops the
-/// stream and exits, so nothing is left streaming after Discord closes.
+/// same file the normal UI saves, unless the start command carries its own.
+/// Closing stdin (the parent exiting) stops the stream and exits, so nothing
+/// is left streaming after Discord closes.
 /// </summary>
 public static class ServeMode
 {
@@ -108,6 +110,8 @@ public static class ServeMode
         WindowDiscovery.DiscordPidOverride = (int?)message["excludePid"];
 
         var settings = LoadSettings();
+        if ((string?)message["endpoint"] is { Length: > 0 } endpoint) settings = settings with { WhipEndpoint = endpoint };
+        if ((string?)message["streamKey"] is { Length: > 0 } key) settings = settings with { BearerToken = key };
         if (string.IsNullOrWhiteSpace(settings.BearerToken))
         {
             Emit(new JsonObject { ["event"] = "ended", ["completed"] = false, ["error"] = "No stream key yet. Open StreamerV2 once and set it." });
